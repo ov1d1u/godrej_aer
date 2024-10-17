@@ -1,5 +1,6 @@
 """The Qingping CGD1 Alarm Clock integration."""
 from __future__ import annotations
+import asyncio
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -23,15 +24,14 @@ async def async_setup_entry(
 ) -> bool:
     """Set up Godrej Aer Smart Matic from a config entry."""
 
-    print("Set up Godrej Aer Smart Matic from a config entry.")
-
     mac = entry.options.get(CONF_MAC, None) or entry.data.get(CONF_MAC, None)
 
     instance = SmartMatic(hass, mac)
     entry.runtime_data = instance
 
     async def _connect_if_needed():
-        await instance.connect_if_needed()
+        if bluetooth.async_address_present(hass, mac, connectable=True):
+            await instance.connect_if_needed()
 
     @callback
     def _async_discovered_device(
@@ -42,7 +42,6 @@ async def async_setup_entry(
         _LOGGER.debug("New service_info: %s", service_info)
         hass.loop.create_task(_connect_if_needed())
 
-    print(f"Subscribe to Bluetooth events:", {ADDRESS: mac})
     entry.async_on_unload(
         bluetooth.async_register_callback(
             hass,

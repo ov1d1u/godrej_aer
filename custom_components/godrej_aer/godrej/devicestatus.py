@@ -17,4 +17,4 @@ class DeviceStatus:
     @property
     def is_valid(self):
         return self.battery_mv is not None and \
-            self.date + DEVICE_STATUS_VALIDITY_TIME < datetime.now()
+            datetime.now() < self.date + DEVICE_STATUS_VALIDITY_TIME

@@ -69,6 +69,7 @@ class SmartMatic:
 
             services = self.client.services
             if not MAIN_SVC in [service.uuid for service in services]:
+                self.client.disconnect()
                 raise InvalidDeviceError("Device does not look right")
 
             self.eventbus.send(DEVICE_CONNECT, self)
@@ -92,8 +93,6 @@ class SmartMatic:
     async def connect_if_needed(self) -> bool:
         if not self.device_status or not self.device_status.is_valid:
             await self.connect()
-            await self.delayed_disconnect()
-
             return True
 
         return False
