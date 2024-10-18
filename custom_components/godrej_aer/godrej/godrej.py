@@ -143,7 +143,11 @@ class SmartMatic:
     async def _ensure_connected(self):
         async def wait_for_connected():
             while not self.client or not self.client.is_connected:
-                await self.connect()
+                try:
+                    await self.connect()
+                except:
+                    await asyncio.sleep(1)
+                    continue
 
         try:
             await asyncio.wait_for(wait_for_connected(), CONNECTION_TIMEOUT)

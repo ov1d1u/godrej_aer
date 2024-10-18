@@ -31,7 +31,11 @@ async def async_setup_entry(
 
     async def _connect_if_needed():
         if bluetooth.async_address_present(hass, mac, connectable=True):
-            await instance.connect_if_needed()
+            try:
+                await instance.connect_if_needed()
+            except:
+                # Fail silently, since this is running in the background
+                pass
 
     @callback
     def _async_discovered_device(
@@ -54,6 +58,8 @@ async def async_setup_entry(
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
+    await set_interval(60, _connect_if_needed)
+
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -68,3 +74,15 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     """Handle options update."""
     instance: SmartMatic = entry.runtime_data
     pass
+
+async def set_interval(interval, coro, *args, **kwargs):
+        async def interval_runner():
+            while True:
+                await asyncio.sleep(interval)
+
+                try:
+                    await coro(*args, **kwargs)
+                except Exception as e:
+                    _LOGGER.error(e, exc_info=True)
+
+        asyncio.create_task(interval_runner())
