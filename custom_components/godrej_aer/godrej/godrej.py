@@ -8,7 +8,8 @@ from homeassistant.components.bluetooth import (
 
 from ..const import (
     DISCONNECT_DELAY,
-    CONNECTION_TIMEOUT
+    CONNECTION_TIMEOUT,
+    STATUS_TIMEOUT
 )
 from .eventbus import EventBus
 from .devicestatus import DeviceStatus
@@ -56,16 +57,16 @@ class SmartMatic:
                 disconnected_callback=self._on_disconnect
             )
 
-            _LOGGER.debug(f"Connecting to {self.mac}...")
+            _LOGGER.debug("Connecting to %s...", self.mac)
             try:
                 await self.client.connect()
             except Exception as e:
-                _LOGGER.debug(f"Failed to connect to {self.mac}: {e}")
-                raise ConnectionError(f"Failed to connect to device: {e}")
+                _LOGGER.debug("Failed to connect to %s: %s", self.mac, e)
+                raise ConnectionError(f"Failed to connect to device: {e}") from e
 
             await asyncio.sleep(2.0)  # give some time for service discovery
 
-            _LOGGER.debug(f"Connected to {self.mac}")
+            _LOGGER.debug("Connected to %s", self.mac)
 
             services = self.client.services
             if not MAIN_SVC in [service.uuid for service in services]:
@@ -79,7 +80,7 @@ class SmartMatic:
                     NOTIFY_CHAR,
                     self._notification_handler
                 )
-            except Exception as e:
+            except Exception:
                 # This always triggers an error for some reason
                 # (Characteristic 6e400001-b5a3-f393-e0a9-e50e24dcca9e
                 # does not have a characteristic client config descriptor),
@@ -99,7 +100,7 @@ class SmartMatic:
 
     async def disconnect(self):
         if self.client and self.client.is_connected:
-            _LOGGER.debug(f"Disconnecting from {self.mac}...")
+            _LOGGER.debug("Disconnecting from %s...", self.mac)
             await self.client.disconnect()
             return True
 
@@ -112,7 +113,7 @@ class SmartMatic:
                 await asyncio.sleep(DISCONNECT_DELAY)
                 await self.disconnect()
             except Exception as e:
-                _LOGGER.debug(f"Failed to disconnect. Error: {e}")
+                _LOGGER.debug("Failed to disconnect. Error: %s", e)
 
         loop = asyncio.get_running_loop()
         if self._disconnect_task is not None:
@@ -122,11 +123,28 @@ class SmartMatic:
     async def get_device_status(self):
         await self._ensure_connected()
 
+        # Reset the event before waiting for new status
+        self._device_status_event.clear()
+
         await self.client.write_gatt_char(
             WRITE_CHAR,
             bytes.fromhex("bf626d54186b626d4e189dff")
         )
-        await self._device_status_event.wait()
+        
+        try:
+            await asyncio.wait_for(
+                self._device_status_event.wait(),
+                STATUS_TIMEOUT
+            )
+        except asyncio.TimeoutError as exc:
+            _LOGGER.warning(
+                "Timeout waiting for device status from %s after %ss",
+                self.mac,
+                STATUS_TIMEOUT
+            )
+            raise ConnectionError(
+                f"Timeout waiting for device status response from {self.mac}"
+            ) from exc
 
         await self.delayed_disconnect()
 
@@ -151,18 +169,18 @@ class SmartMatic:
 
         try:
             await asyncio.wait_for(wait_for_connected(), CONNECTION_TIMEOUT)
-        except asyncio.TimeoutError:
-            raise NotConnectedError("Connection timeout")
+        except asyncio.TimeoutError as exc:
+            raise NotConnectedError("Connection timeout") from exc
 
     async def _notification_handler(self, sender, data):
         if sender.uuid.lower() == NOTIFY_CHAR.lower():
-            _LOGGER.debug(f"<< {sender.uuid}: {data.hex()}")
+            _LOGGER.debug("<< %s: %s", sender.uuid, data.hex())
             if len(data) == 99:
                 self.device_status = DeviceStatus(data)
                 self._device_status_event.set()
                 self.eventbus.send(DEVICE_STATUS_UPDATE, self.device_status)
 
-    def _on_disconnect(self, client: BleakClient):
+    def _on_disconnect(self, _client: BleakClient):
         if self._disconnect_task is not None:
             self._disconnect_task.cancel()
             self._disconnect_task = None
