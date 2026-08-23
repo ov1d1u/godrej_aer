@@ -55,32 +55,38 @@ class SmartMatic:
             device = async_ble_device_from_address(
                 self.hass, self.mac
             )
-            self.client = BleakClient(
+            client = BleakClient(
                 device,
                 disconnected_callback=self._on_disconnect
             )
+            self.client = client
 
             _LOGGER.debug("Connecting to %s...", self.mac)
             try:
-                await self.client.connect()
+                await client.connect()
             except Exception as e:
                 _LOGGER.debug("Failed to connect to %s: %s", self.mac, e)
                 raise ConnectionError(f"Failed to connect to device: {e}") from e
 
             await asyncio.sleep(2.0)  # give some time for service discovery
 
+            if not client.is_connected:
+                raise ConnectionError(
+                    f"Device {self.mac} disconnected during service discovery"
+                )
+
             _LOGGER.debug("Connected to %s, discovering services...", self.mac)
 
-            services = self.client.services
+            services = client.services
             if not MAIN_SVC in [service.uuid for service in services]:
-                await self.client.disconnect()
+                await client.disconnect()
                 raise InvalidDeviceError("Device does not look right")
 
             self.eventbus.send(DEVICE_CONNECT, self)
 
             try:
                 _LOGGER.debug("Subscribing to notifications on %s...", NOTIFY_CHAR)
-                await self.client.start_notify(
+                await client.start_notify(
                     NOTIFY_CHAR,
                     self._notification_handler
                 )
