@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from bleak import BleakClient
+from bleak_retry_connector import establish_connection
 
 from homeassistant.components.bluetooth import (
     async_ble_device_from_address
@@ -52,18 +53,24 @@ class SmartMatic:
             device = async_ble_device_from_address(
                 self.hass, self.mac
             )
-            client = BleakClient(
-                device,
-                disconnected_callback=self._on_disconnect
-            )
-            self.client = client
+            if device is None:
+                raise ConnectionError(
+                    f"Device {self.mac} is not currently available over Bluetooth"
+                )
 
             _LOGGER.debug("Connecting to %s...", self.mac)
             try:
-                await client.connect()
+                client = await establish_connection(
+                    BleakClient,
+                    device,
+                    self.mac,
+                    disconnected_callback=self._on_disconnect,
+                )
             except Exception as e:
                 _LOGGER.debug("Failed to connect to %s: %s", self.mac, e)
                 raise ConnectionError(f"Failed to connect to device: {e}") from e
+
+            self.client = client
 
             await asyncio.sleep(2.0)  # give some time for service discovery
 
@@ -116,7 +123,7 @@ class SmartMatic:
 
     async def delayed_disconnect(self):
         async def _delayed_disconnect():
-            if not self.client.is_connected:
+            if not self.client or not self.client.is_connected:
                 _LOGGER.debug("%s already disconnected, skipping delayed disconnect.", self.mac)
                 return
 
