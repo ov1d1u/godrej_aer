@@ -26,7 +26,14 @@ class SmartMaticBatteryVoltageSensor(SensorEntity):
         self._config_entry = config_entry
         self._attr_unique_id = f"{config_entry.entry_id}_battery_voltage"
 
-        instance.eventbus.add_listener(
+    async def async_added_to_hass(self) -> None:
+        self._instance.eventbus.add_listener(
+            DEVICE_STATUS_UPDATE,
+            self.on_status_update
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._instance.eventbus.remove_listener(
             DEVICE_STATUS_UPDATE,
             self.on_status_update
         )
@@ -37,4 +44,4 @@ class SmartMaticBatteryVoltageSensor(SensorEntity):
 
     async def on_status_update(self, device_status: DeviceStatus):
         self._attr_native_value = device_status.battery_mv
-        self.schedule_update_ha_state()
+        self.async_write_ha_state()

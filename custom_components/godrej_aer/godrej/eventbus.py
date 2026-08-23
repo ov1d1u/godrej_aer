@@ -11,8 +11,12 @@ class EventBus:
       self.listeners[event_name].add(listener)
 
   def remove_listener(self, event_name, listener):
-    self.listeners[event_name].remove(listener)
-    if len(self.listeners[event_name]) == 0:
+    listeners = self.listeners.get(event_name)
+    if not listeners:
+      return
+
+    listeners.discard(listener)
+    if len(listeners) == 0:
       del self.listeners[event_name]
 
   def send(self, event_name, event_data=None):

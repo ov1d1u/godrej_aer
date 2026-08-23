@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from bleak import BleakClient, BleakError
+from bleak import BleakClient
 
 from homeassistant.components.bluetooth import (
     async_ble_device_from_address
@@ -8,14 +8,12 @@ from homeassistant.components.bluetooth import (
 
 from ..const import (
     DISCONNECT_DELAY,
-    CONNECTION_TIMEOUT,
     STATUS_TIMEOUT
 )
 from .eventbus import EventBus
 from .devicestatus import DeviceStatus
 from .exception import (
     InvalidDeviceError,
-    NotConnectedError,
     ConnectionError
 )
 from .events import (
@@ -32,17 +30,16 @@ WRITE_CHAR  = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 
 
 class SmartMatic:
-    client: BleakClient | None = None
-    device_status: DeviceStatus | None = None
-    eventbus: EventBus = EventBus()
-
-    _connect_lock = asyncio.Lock()
-    _device_status_event = asyncio.Event()
-    _disconnect_task: asyncio.Task = None
-
     def __init__(self, hass, mac):
         self.hass = hass
         self.mac = mac
+        self.client: BleakClient | None = None
+        self.device_status: DeviceStatus | None = None
+        self.eventbus = EventBus()
+
+        self._connect_lock = asyncio.Lock()
+        self._device_status_event = asyncio.Event()
+        self._disconnect_task: asyncio.Task | None = None
 
     async def connect(self) -> bool:
         _LOGGER.debug("Trying to connect to device %s...", self.mac)
@@ -78,7 +75,7 @@ class SmartMatic:
             _LOGGER.debug("Connected to %s, discovering services...", self.mac)
 
             services = client.services
-            if not MAIN_SVC in [service.uuid for service in services]:
+            if MAIN_SVC not in [service.uuid for service in services]:
                 await client.disconnect()
                 raise InvalidDeviceError("Device does not look right")
 

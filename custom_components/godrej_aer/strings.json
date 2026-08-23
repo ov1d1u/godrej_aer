@@ -2,16 +2,28 @@
   "config": {
     "step": {
       "user": {
+        "title": "Select Device",
         "data": {
-          "host": "[%key:common::config_flow::data::host%]",
-          "username": "[%key:common::config_flow::data::username%]",
-          "password": "[%key:common::config_flow::data::password%]"
+          "mac": "Device"
+        }
+      },
+      "manual_mac": {
+        "title": "Enter MAC Address",
+        "data": {
+          "mac": "MAC Address"
+        }
+      },
+      "name": {
+        "title": "Name Device",
+        "data": {
+          "name": "Name"
         }
       }
     },
     "error": {
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
-      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+      "invalid_mac": "Invalid MAC address",
+      "invalid_device": "This is not a supported Smart Matic device",
       "unknown": "[%key:common::config_flow::error::unknown%]"
     },
     "abort": {

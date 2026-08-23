@@ -29,7 +29,7 @@ class SmartMaticButton(ButtonEntity):
         self._instance: SmartMatic = instance
         self._config_entry: ConfigEntry = config_entry
         self._attr_name = config_entry.data[CONF_NAME]
-        self._attr_unique_id = f"{config_entry.data[CONF_NAME]}_trigger"
+        self._attr_unique_id = f"{config_entry.entry_id}_trigger"
         self._attr_icon = "mdi:spray"
 
     @property

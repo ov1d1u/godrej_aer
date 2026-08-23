@@ -5,15 +5,27 @@
         },
         "error": {
             "cannot_connect": "Failed to connect",
-            "invalid_auth": "Invalid authentication",
+            "invalid_mac": "Invalid MAC address",
+            "invalid_device": "This is not a supported Smart Matic device",
             "unknown": "Unexpected error"
         },
         "step": {
             "user": {
+                "title": "Select Device",
                 "data": {
-                    "host": "Host",
-                    "password": "Password",
-                    "username": "Username"
+                    "mac": "Device"
+                }
+            },
+            "manual_mac": {
+                "title": "Enter MAC Address",
+                "data": {
+                    "mac": "MAC Address"
+                }
+            },
+            "name": {
+                "title": "Name Device",
+                "data": {
+                    "name": "Name"
                 }
             }
         }

@@ -1,6 +1,6 @@
-"""The Qingping CGD1 Alarm Clock integration."""
+"""The Godrej Aer Smart Matic integration."""
 from __future__ import annotations
-import asyncio
+from datetime import timedelta
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -8,6 +8,7 @@ from homeassistant.const import Platform, CONF_MAC
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
+from homeassistant.helpers.event import async_track_time_interval
 
 from .godrej import SmartMatic
 
@@ -33,9 +34,8 @@ async def async_setup_entry(
         if bluetooth.async_address_present(hass, mac, connectable=True):
             try:
                 await instance.connect_if_needed()
-            except:
-                # Fail silently, since this is running in the background
-                pass
+            except Exception:
+                _LOGGER.debug("Background connect attempt failed for %s", mac, exc_info=True)
 
     @callback
     def _async_discovered_device(
@@ -44,7 +44,7 @@ async def async_setup_entry(
     ):
         """Subscribe to bluetooth changes."""
         _LOGGER.debug("New service_info: %s", service_info)
-        hass.loop.create_task(_connect_if_needed())
+        hass.async_create_task(_connect_if_needed())
 
     entry.async_on_unload(
         bluetooth.async_register_callback(
@@ -58,7 +58,15 @@ async def async_setup_entry(
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
-    await set_interval(60, _connect_if_needed)
+    @callback
+    def _async_periodic_connect(_now):
+        hass.async_create_task(_connect_if_needed())
+
+    entry.async_on_unload(
+        async_track_time_interval(hass, _async_periodic_connect, timedelta(seconds=60))
+    )
+
+    await _connect_if_needed()
 
     return True
 
@@ -72,17 +80,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle options update."""
-    instance: SmartMatic = entry.runtime_data
-    pass
-
-async def set_interval(interval, coro, *args, **kwargs):
-        async def interval_runner():
-            while True:
-                await asyncio.sleep(interval)
-
-                try:
-                    await coro(*args, **kwargs)
-                except Exception as e:
-                    _LOGGER.error(e, exc_info=True)
-
-        asyncio.create_task(interval_runner())
+    _LOGGER.debug("Config entry %s updated", entry.entry_id)

@@ -16,6 +16,7 @@ from homeassistant.components.bluetooth import (
 
 from .const import DOMAIN
 from .godrej import SmartMatic
+from .godrej.exception import InvalidDeviceError, ConnectionError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,15 +29,15 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self):
         self.name = "Godrej Aer Smart Matic"
         self.mac = None
+        self._manual_entry = False
 
     def _is_device_supported(self, device_info):
-        return "smart matic" in device_info.name.lower()
+        name = device_info.name or ""
+        return "smart matic" in name.lower()
 
     async def _validate_device(self, smartmatic):
-        assert await smartmatic.connect()
-        await smartmatic.disconnect()
-
-        return None
+        if not await smartmatic.connect():
+            raise ConnectionError("Unable to connect")
 
     async def async_step_user(
         self,
@@ -46,8 +47,10 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
         """Handle the initial step."""
         if user_input is not None:
             if user_input[CONF_MAC] == MANUAL_MAC:
+                self._manual_entry = True
                 return await self.async_step_manual_mac()
 
+            self._manual_entry = False
             self.mac = user_input[CONF_MAC]
             await self.async_set_unique_id(format_mac(self.mac), raise_on_progress=False)
             self._abort_if_unique_id_configured()
@@ -77,12 +80,24 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_manual_mac(
-        self, user_input: dict[str, Any] | None = None
+        self,
+        user_input: dict[str, Any] | None = None,
+        errors: dict[str, str] | None = None,
     ) -> ConfigFlowResult:
         """Handle manual mac step."""
         if user_input is not None:
             self.mac = user_input[CONF_MAC]
-            await self.async_set_unique_id(format_mac(self.mac), raise_on_progress=False)
+
+            try:
+                normalized_mac = format_mac(self.mac)
+            except ValueError:
+                return self.async_show_form(
+                    step_id="manual_mac",
+                    data_schema=vol.Schema({vol.Required(CONF_MAC): str}),
+                    errors={"base": "invalid_mac"},
+                )
+
+            await self.async_set_unique_id(normalized_mac, raise_on_progress=False)
             self._abort_if_unique_id_configured()
             return await self.async_step_validate()
 
@@ -93,7 +108,8 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
                     vol.Required(CONF_MAC): str
                 }
             ),
-            errors={})
+            errors=errors or {},
+        )
 
     async def async_step_validate(
         self, user_input: "dict[str, Any] | None" = None
@@ -102,13 +118,20 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
         error = None
         smartmatic = SmartMatic(self.hass, self.mac)
         try:
-            error = await self._validate_device(smartmatic)
-        except Exception as e:
-            error = str(e)
+            await self._validate_device(smartmatic)
+        except InvalidDeviceError:
+            error = "invalid_device"
+        except ConnectionError:
+            error = "cannot_connect"
+        except Exception:
+            _LOGGER.exception("Unexpected error while validating %s", self.mac)
+            error = "unknown"
         finally:
             await smartmatic.disconnect()
 
         if error:
+            if self._manual_entry:
+                return await self.async_step_manual_mac(errors={"base": error})
             return await self.async_step_user(errors={"base": error})
 
         return await self.async_step_name()
