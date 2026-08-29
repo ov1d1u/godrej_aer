@@ -4,10 +4,15 @@ This is a custom integration for Home Assistant to support Godrej Aer Smart Mati
 
 ## Supported Features
 
-This integration currently only supports the following features:
+This integration currently supports the following features:
 
-- Trigger the device via a `button` entity
+- Spray once via a `button` entity
+- Turn auto-spray on/off via a `switch` entity
+- Choose the auto-spray interval (10 / 20 / 40 minutes) via a `select` entity
+- Reset the refill level via a `button` entity (after replacing the cartridge)
 - Battery level monitoring (in mV)
+- Estimated refill level (%) and lifetime spray count sensors
+- Connection state via a `binary_sensor` entity
 - On-demand status refresh via the `godrej_aer.update_status` service
 
 ## Services

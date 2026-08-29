@@ -16,6 +16,9 @@ from .const import (
     MAIN_SVC,
     NOTIFY_CHAR,
     WRITE_CHAR,
+    SPRAY_INTERVALS,
+    DEFAULT_SPRAY_INTERVAL,
+    DESIRED_MTU,
 )
 from .eventbus import EventBus
 from .devicestatus import DeviceStatus
@@ -59,25 +62,39 @@ def _cbor_key(text: str) -> bytes:
     return bytes([0x60 | len(raw)]) + raw
 
 
-def encode_message(**fields: int) -> bytes:
-    """Encode a device message as an indefinite-length CBOR map of ints.
+def encode_message(**fields: int | bool) -> bytes:
+    """Encode a device message as an indefinite-length CBOR map.
 
     Mirrors the official app, which builds these with Jackson's
     ``writeStartObject()`` / ``writeEndObject()`` (emitting ``BF … FF``)
-    and passes the *response* message type as ``mN``.
+    and passes the *response* message type as ``mN``. Values are ints, or
+    bools (encoded as CBOR true/false).
     """
     out = bytearray([0xBF])  # indefinite-length map
     for key, value in fields.items():
-        out += _cbor_key(key) + _cbor_int(value)
+        out += _cbor_key(key)
+        if isinstance(value, bool):  # must precede the int check
+            out += bytes([0xF5 if value else 0xF4])
+        else:
+            out += _cbor_int(value)
     out += bytes([0xFF])  # break
     return bytes(out)
+
+
+def spray_now_msg(interval: int = 0) -> bytes:
+    """Spray-now message. ``interval`` in minutes; 0 means "once, now",
+    a positive value starts auto-spraying at that interval."""
+    return encode_message(mT=104, mN=154, rI=interval)
 
 
 # {"mT": 107, "mN": 157} -> bf626d54186b626d4e189dff
 FETCH_STATUS_MSG = encode_message(mT=107, mN=157)
 # {"mT": 104, "mN": 154, "rI": 0} -> bf626d541868626d4e189a62724900ff
-# rI is the spray interval in minutes; 0 means "spray once now".
-SPRAY_NOW_MSG = encode_message(mT=104, mN=154, rI=0)
+SPRAY_NOW_MSG = spray_now_msg(0)
+# {"mT": 106, "mN": 156, "sS": true} -> stop auto-spray
+STOP_SPRAY_MSG = encode_message(mT=106, mN=156, sS=True)
+# {"mT": 105, "mN": 155, "rR": true} -> mark the cartridge as refilled
+RESET_REFILL_MSG = encode_message(mT=105, mN=155, rR=True)
 
 
 def encode_set_time(now: datetime | None = None) -> bytes:
@@ -221,11 +238,48 @@ class SmartMatic:
                     "Failed start_notify on %s for %s: %s",
                     NOTIFY_CHAR, self.mac, e
                 )
+
+            await self._request_mtu()
         except BaseException:
             # Includes asyncio.CancelledError: if the caller's task is
             # cancelled mid-connect we still must not leak the BLE link.
             await self._cleanup_connection()
             raise
+
+    async def _request_mtu(self):
+        """Negotiate a larger ATT MTU, mirroring the official app.
+
+        Best effort only. Which of these works depends on the bleak
+        backend: BlueZ negotiates automatically and exposes only a way to
+        force the exchange early; CoreBluetooth and ESPHome proxies size
+        the MTU themselves. A failure here is harmless, so it is only
+        logged.
+        """
+        client = self.client
+        if client is None:
+            return
+
+        try:
+            request_mtu = getattr(client, "request_mtu", None)
+            if request_mtu is not None:
+                # Not in bleak's public API today, but some wrappers add it.
+                await request_mtu(DESIRED_MTU)
+            else:
+                backend = getattr(client, "_backend", None)
+                # BlueZ: force the MTU exchange that would otherwise be lazy.
+                negotiate = (
+                    getattr(backend, "_acquire_mtu", None)
+                    or getattr(backend, "_negotiate_mtu", None)
+                )
+                if negotiate is not None:
+                    await negotiate()
+        except Exception as e:
+            _LOGGER.debug("MTU negotiation with %s failed: %s", self.mac, e)
+
+        try:
+            _LOGGER.debug("MTU for %s is %s", self.mac, client.mtu_size)
+        except Exception:
+            pass
 
     async def connect_if_needed(self) -> bool:
         if self.device_status and self.device_status.is_valid:
@@ -365,15 +419,65 @@ class SmartMatic:
 
         await self.delayed_disconnect()
 
-    async def trigger(self):
-        _LOGGER.debug("Triggering device %s...", self.mac)
+    async def _write_action(self, payload: bytes, *, refresh: bool = True):
+        """Send a command that changes device state.
+
+        Connects if needed, writes the message, then (by default) reads
+        the status back so entity state reflects reality. The command has
+        already been delivered by the time a status refresh fails, so that
+        failure is logged, not raised.
+        """
         await self._ensure_connected()
 
-        _LOGGER.debug("Writing to %s on %s...", WRITE_CHAR, self.mac)
-        await self.client.write_gatt_char(WRITE_CHAR, SPRAY_NOW_MSG)
+        _LOGGER.debug(">> %s: %s", WRITE_CHAR, payload.hex())
+        await self.client.write_gatt_char(WRITE_CHAR, payload)
         _LOGGER.debug("Write complete.")
 
-        await self.delayed_disconnect()
+        if not refresh:
+            await self.delayed_disconnect()
+            return
+
+        # Give the device a moment to apply the change before reading back.
+        await asyncio.sleep(2.0)
+        try:
+            await self.get_device_status()
+        except Exception as e:
+            _LOGGER.warning(
+                "Status refresh after action on %s failed: %s", self.mac, e
+            )
+            await self.delayed_disconnect()
+
+    async def spray_now(self):
+        """Spray once, now."""
+        _LOGGER.debug("Spray now on %s...", self.mac)
+        await self._write_action(SPRAY_NOW_MSG)
+
+    async def set_spray_interval(self, interval: int):
+        """Start auto-spraying every ``interval`` minutes (10, 20 or 40)."""
+        if interval not in SPRAY_INTERVALS:
+            raise ValueError(
+                f"Unsupported spray interval {interval}; "
+                f"expected one of {SPRAY_INTERVALS}"
+            )
+        _LOGGER.debug("Set spray interval %s min on %s...", interval, self.mac)
+        await self._write_action(spray_now_msg(interval))
+
+    async def stop_spray(self):
+        """Stop auto-spraying."""
+        _LOGGER.debug("Stop auto-spray on %s...", self.mac)
+        await self._write_action(STOP_SPRAY_MSG)
+
+    async def set_auto_spray(self, enabled: bool, interval: int | None = None):
+        """Turn auto-spray on (at ``interval`` or the default) or off."""
+        if enabled:
+            await self.set_spray_interval(interval or DEFAULT_SPRAY_INTERVAL)
+        else:
+            await self.stop_spray()
+
+    async def reset_refill(self):
+        """Tell the device its cartridge has been refilled."""
+        _LOGGER.debug("Reset refill on %s...", self.mac)
+        await self._write_action(RESET_REFILL_MSG)
 
     async def _ensure_connected(self):
         """Make sure the BLE link is up, without requiring a status read.

@@ -7,9 +7,11 @@ from .godrej import SmartMatic
 
 @callback
 def async_device_device_info_fn(smartmatic: SmartMatic, name: str) -> DeviceInfo:
+    status = smartmatic.device_status
     return DeviceInfo(
         connections={(CONNECTION_BLUETOOTH, smartmatic.mac)},
         manufacturer="Godrej Aer",
         model="Smart Matic",
-        name=name
+        name=name,
+        sw_version=status.firmware_version if status else None,
     )

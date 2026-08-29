@@ -17,7 +17,9 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS: list[Platform] = [
     Platform.SENSOR,
     Platform.BUTTON,
-    Platform.BINARY_SENSOR
+    Platform.BINARY_SENSOR,
+    Platform.SWITCH,
+    Platform.SELECT,
 ]
 
 async def async_setup_entry(
