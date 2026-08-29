@@ -11,6 +11,7 @@ from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackM
 from homeassistant.helpers.event import async_track_time_interval
 
 from .godrej import SmartMatic
+from .services import async_setup_services, async_unload_services
 
 _LOGGER = logging.getLogger(__name__)
 PLATFORMS: list[Platform] = [
@@ -29,6 +30,8 @@ async def async_setup_entry(
 
     instance = SmartMatic(hass, mac)
     entry.runtime_data = instance
+
+    async_setup_services(hass)
 
     async def _connect_if_needed():
         if bluetooth.async_address_present(hass, mac, connectable=True):
@@ -76,6 +79,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         instance: SmartMatic = entry.runtime_data
         await instance.disconnect()
+        async_unload_services(hass, entry)
     return unload_ok
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:

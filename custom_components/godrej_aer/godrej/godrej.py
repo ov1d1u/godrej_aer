@@ -1,15 +1,21 @@
 import asyncio
 import logging
+from datetime import datetime, timedelta
 from bleak import BleakClient
 from bleak_retry_connector import establish_connection
 
 from homeassistant.components.bluetooth import (
     async_ble_device_from_address
 )
+from homeassistant.util import dt as dt_util
 
-from ..const import (
+from .const import (
     DISCONNECT_DELAY,
-    STATUS_TIMEOUT
+    STATUS_TIMEOUT,
+    CONNECT_RETRY_COOLDOWN,
+    MAIN_SVC,
+    NOTIFY_CHAR,
+    WRITE_CHAR,
 )
 from .eventbus import EventBus
 from .devicestatus import DeviceStatus
@@ -25,9 +31,88 @@ from .events import (
 
 _LOGGER = logging.getLogger(__name__)
 
-MAIN_SVC    = "6e400000-b5a3-f393-e0a9-e50e24dcca9e"
-NOTIFY_CHAR = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-WRITE_CHAR  = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+
+def _cbor_uint(n: int) -> bytes:
+    """Encode a non-negative int as a CBOR major-type-0 value."""
+    if n < 24:
+        return bytes([n])
+    if n < 0x100:
+        return bytes([0x18, n])
+    if n < 0x10000:
+        return bytes([0x19]) + n.to_bytes(2, "big")
+    if n < 0x100000000:
+        return bytes([0x1A]) + n.to_bytes(4, "big")
+    return bytes([0x1B]) + n.to_bytes(8, "big")
+
+
+def _cbor_int(n: int) -> bytes:
+    """Encode a (possibly negative) int as CBOR."""
+    if n >= 0:
+        return _cbor_uint(n)
+    head = _cbor_uint(-1 - n)
+    return bytes([head[0] | 0x20]) + head[1:]
+
+
+def _cbor_key(text: str) -> bytes:
+    """Encode a short (<24 char) ASCII map key as a CBOR text string."""
+    raw = text.encode("ascii")
+    return bytes([0x60 | len(raw)]) + raw
+
+
+def encode_message(**fields: int) -> bytes:
+    """Encode a device message as an indefinite-length CBOR map of ints.
+
+    Mirrors the official app, which builds these with Jackson's
+    ``writeStartObject()`` / ``writeEndObject()`` (emitting ``BF … FF``)
+    and passes the *response* message type as ``mN``.
+    """
+    out = bytearray([0xBF])  # indefinite-length map
+    for key, value in fields.items():
+        out += _cbor_key(key) + _cbor_int(value)
+    out += bytes([0xFF])  # break
+    return bytes(out)
+
+
+# {"mT": 107, "mN": 157} -> bf626d54186b626d4e189dff
+FETCH_STATUS_MSG = encode_message(mT=107, mN=157)
+# {"mT": 104, "mN": 154, "rI": 0} -> bf626d541868626d4e189a62724900ff
+# rI is the spray interval in minutes; 0 means "spray once now".
+SPRAY_NOW_MSG = encode_message(mT=104, mN=154, rI=0)
+
+
+def encode_set_time(now: datetime | None = None) -> bytes:
+    """Build the ``mT=102`` set-time message the way the official app does.
+
+    The app sends an indefinite-length CBOR map with the epoch (``eP``,
+    always forced to a fixed 8-byte integer), the standard (non-DST) UTC
+    offset in minutes negated (``tZ``), and the zone's DST savings in
+    milliseconds (``tD``). ``mN`` is the response message type (152), same
+    quirk as the fetch-status message.
+    """
+    now = now or dt_util.now()
+    epoch = int(now.timestamp())
+
+    utcoffset = now.utcoffset() or timedelta()
+    dst = now.dst() or timedelta()
+    raw_offset_minutes = int((utcoffset - dst).total_seconds() // 60)
+    tz = raw_offset_minutes * -1
+
+    tzinfo = now.tzinfo
+    dst_savings_ms = 0
+    if tzinfo is not None:
+        year = now.year
+        jan = datetime(year, 1, 1, tzinfo=tzinfo).dst() or timedelta()
+        jul = datetime(year, 7, 1, tzinfo=tzinfo).dst() or timedelta()
+        dst_savings_ms = int(max(jan, jul).total_seconds() * 1000)
+
+    out = bytearray([0xBF])  # indefinite-length map
+    out += _cbor_key("mT") + _cbor_uint(102)
+    out += _cbor_key("mN") + _cbor_uint(152)
+    out += _cbor_key("eP") + bytes([0x1B]) + epoch.to_bytes(8, "big")
+    out += _cbor_key("tZ") + _cbor_int(tz)
+    out += _cbor_key("tD") + _cbor_int(dst_savings_ms)
+    out += bytes([0xFF])
+    return bytes(out)
 
 
 class SmartMatic:
@@ -41,37 +126,67 @@ class SmartMatic:
         self._connect_lock = asyncio.Lock()
         self._device_status_event = asyncio.Event()
         self._disconnect_task: asyncio.Task | None = None
+        self._retry_after: datetime | None = None
 
     async def connect(self) -> bool:
-        _LOGGER.debug("Trying to connect to device %s...", self.mac)
-        
+        """Open the BLE link and fetch a fresh device status.
+
+        Used by the polling path. A status timeout here is treated as a
+        connect failure. For just actuating the device (button press) use
+        trigger(), which does not depend on the status read.
+        """
         async with self._connect_lock:
-            if self.client and self.client.is_connected:
-                _LOGGER.debug("Already connected to %s", self.mac)
-                return True
+            await self._open_connection()
 
-            device = async_ble_device_from_address(
-                self.hass, self.mac
-            )
-            if device is None:
-                raise ConnectionError(
-                    f"Device {self.mac} is not currently available over Bluetooth"
-                )
-
-            _LOGGER.debug("Connecting to %s...", self.mac)
             try:
-                client = await establish_connection(
-                    BleakClient,
-                    device,
-                    self.mac,
-                    disconnected_callback=self._on_disconnect,
-                )
-            except Exception as e:
-                _LOGGER.debug("Failed to connect to %s: %s", self.mac, e)
-                raise ConnectionError(f"Failed to connect to device: {e}") from e
+                await self._set_time()
+                await self.get_device_status()
+            except BaseException:
+                await self._cleanup_connection()
+                raise
 
-            self.client = client
+        return True
 
+    async def _open_connection(self):
+        """Establish the BLE link and subscribe to notifications.
+
+        The caller must hold ``self._connect_lock``. On any failure after
+        the link is up, the connection is torn down before the exception
+        propagates, so a failed attempt never leaves the device connected
+        (which would drain its battery).
+        """
+        _LOGGER.debug("Trying to connect to device %s...", self.mac)
+
+        if self.client and self.client.is_connected:
+            _LOGGER.debug("Already connected to %s", self.mac)
+            return
+
+        device = async_ble_device_from_address(
+            self.hass, self.mac
+        )
+        if device is None:
+            raise ConnectionError(
+                f"Device {self.mac} is not currently available over Bluetooth"
+            )
+
+        _LOGGER.debug("Connecting to %s...", self.mac)
+        try:
+            client = await establish_connection(
+                BleakClient,
+                device,
+                self.mac,
+                disconnected_callback=self._on_disconnect,
+            )
+        except Exception as e:
+            _LOGGER.debug("Failed to connect to %s: %s", self.mac, e)
+            raise ConnectionError(f"Failed to connect to device: {e}") from e
+
+        self.client = client
+
+        # From here on the BLE link is open. Any failure must disconnect
+        # it, otherwise we stay connected indefinitely and drain the
+        # device battery.
+        try:
             await asyncio.sleep(2.0)  # give some time for service discovery
 
             if not client.is_connected:
@@ -82,8 +197,15 @@ class SmartMatic:
             _LOGGER.debug("Connected to %s, discovering services...", self.mac)
 
             services = client.services
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                for service in services:
+                    for char in service.characteristics:
+                        _LOGGER.debug(
+                            "%s: char %s props=%s",
+                            self.mac, char.uuid, ",".join(char.properties)
+                        )
+
             if MAIN_SVC not in [service.uuid for service in services]:
-                await client.disconnect()
                 raise InvalidDeviceError("Device does not look right")
 
             self.eventbus.send(DEVICE_CONNECT, self)
@@ -94,23 +216,48 @@ class SmartMatic:
                     NOTIFY_CHAR,
                     self._notification_handler
                 )
-            except Exception:
-                # This always triggers an error for some reason
-                # (Characteristic 6e400001-b5a3-f393-e0a9-e50e24dcca9e
-                # does not have a characteristic client config descriptor),
-                # but notifications are enabled anyway.
-                pass
-
-            await self.get_device_status()
-
-            return True
+            except Exception as e:
+                _LOGGER.debug(
+                    "Failed start_notify on %s for %s: %s",
+                    NOTIFY_CHAR, self.mac, e
+                )
+        except BaseException:
+            # Includes asyncio.CancelledError: if the caller's task is
+            # cancelled mid-connect we still must not leak the BLE link.
+            await self._cleanup_connection()
+            raise
 
     async def connect_if_needed(self) -> bool:
-        if not self.device_status or not self.device_status.is_valid:
-            await self.connect()
-            return True
+        if self.device_status and self.device_status.is_valid:
+            return False
 
-        return False
+        if self._retry_after is not None and datetime.now() < self._retry_after:
+            _LOGGER.debug(
+                "Skipping connect to %s, in retry cooldown until %s",
+                self.mac, self._retry_after
+            )
+            return False
+
+        if self._connect_lock.locked():
+            _LOGGER.debug(
+                "Skipping connect to %s, an attempt is already in progress",
+                self.mac
+            )
+            return False
+
+        try:
+            await self.connect()
+        except Exception:
+            self._retry_after = datetime.now() + timedelta(
+                seconds=CONNECT_RETRY_COOLDOWN
+            )
+            _LOGGER.debug(
+                "Connect to %s failed, next attempt no sooner than %s",
+                self.mac, self._retry_after
+            )
+            raise
+
+        return True
 
     async def disconnect(self):
         if self.client and self.client.is_connected:
@@ -120,6 +267,28 @@ class SmartMatic:
         
         _LOGGER.debug("%s already disconnected.", self.mac)
         return False
+
+    async def _cleanup_connection(self):
+        """Tear down a half-established connection after a failed attempt.
+
+        Cancels any pending disconnect task and force-disconnects the BLE
+        client so a failed connect() never leaves the device connected.
+        """
+        client = self.client
+        self.client = None
+
+        if self._disconnect_task is not None:
+            self._disconnect_task.cancel()
+            self._disconnect_task = None
+
+        if client is None:
+            return
+
+        _LOGGER.debug("Cleaning up failed connection to %s...", self.mac)
+        try:
+            await client.disconnect()
+        except Exception as e:
+            _LOGGER.debug("Error while cleaning up connection to %s: %s", self.mac, e)
 
     async def delayed_disconnect(self):
         async def _delayed_disconnect():
@@ -140,6 +309,31 @@ class SmartMatic:
             self._disconnect_task.cancel()
         self._disconnect_task = loop.create_task(_delayed_disconnect())
 
+    async def _set_time(self):
+        """Push the current time to the device before reading status.
+
+        The official app sends this on every connect. Some devices (in
+        particular ones that were never set up through the official app)
+        do not emit a usable status frame until their clock has been set
+        at least once. A failure here is logged but not fatal: the status
+        read that follows is the real success criterion.
+        """
+        try:
+            payload = encode_set_time()
+        except Exception as e:  # pragma: no cover - defensive
+            _LOGGER.warning("Could not build set-time message for %s: %s", self.mac, e)
+            return
+
+        _LOGGER.debug(">> %s: %s (set time)", WRITE_CHAR, payload.hex())
+        try:
+            await self.client.write_gatt_char(WRITE_CHAR, payload)
+        except Exception as e:
+            _LOGGER.debug("Failed to set time on %s: %s", self.mac, e)
+            return
+
+        # Match the app's pacing between messages.
+        await asyncio.sleep(1.0)
+
     async def get_device_status(self):
         _LOGGER.debug("Getting device status from %s...", self.mac)
         
@@ -147,11 +341,8 @@ class SmartMatic:
         self._device_status_event.clear()
 
         _LOGGER.debug("Writing to %s on %s...", WRITE_CHAR, self.mac)
-        await self.client.write_gatt_char(
-            WRITE_CHAR,
-            bytes.fromhex("bf626d54186b626d4e189dff")
-        )
-        
+        await self.client.write_gatt_char(WRITE_CHAR, FETCH_STATUS_MSG)
+
         try:
             _LOGGER.debug("Waiting for device status from %s...", self.mac)
             
@@ -169,6 +360,9 @@ class SmartMatic:
                 f"Timeout waiting for device status response from {self.mac}"
             ) from exc
 
+        # Got a fresh status, clear any retry cooldown from earlier failures.
+        self._retry_after = None
+
         await self.delayed_disconnect()
 
     async def trigger(self):
@@ -176,30 +370,25 @@ class SmartMatic:
         await self._ensure_connected()
 
         _LOGGER.debug("Writing to %s on %s...", WRITE_CHAR, self.mac)
-        await self.client.write_gatt_char(
-            WRITE_CHAR,
-            bytes.fromhex("bf626d541868626d4e189a62724900ff")
-        )
+        await self.client.write_gatt_char(WRITE_CHAR, SPRAY_NOW_MSG)
         _LOGGER.debug("Write complete.")
 
         await self.delayed_disconnect()
 
     async def _ensure_connected(self):
-        if not self.client or not self.client.is_connected:
-            _LOGGER.debug("Not connected, connecting to %s...", self.mac)
-            await self.connect()
-        # async def wait_for_connected():
-        #     while not self.client or not self.client.is_connected:
-        #         try:
-        #             await self.connect()
-        #         except:
-        #             await asyncio.sleep(1)
-        #             continue
+        """Make sure the BLE link is up, without requiring a status read.
 
-        # try:
-        #     await asyncio.wait_for(wait_for_connected(), CONNECTION_TIMEOUT)
-        # except asyncio.TimeoutError as exc:
-        #     raise NotConnectedError("Connection timeout") from exc
+        This is the path used for actuating the device (button press): it
+        must succeed whenever the device is reachable, even if status
+        notifications are currently not coming back, and it ignores the
+        polling retry cooldown.
+        """
+        if self.client and self.client.is_connected:
+            return
+
+        async with self._connect_lock:
+            _LOGGER.debug("Not connected, connecting to %s...", self.mac)
+            await self._open_connection()
 
     async def _notification_handler(self, sender, data):
         if sender.uuid.lower() == NOTIFY_CHAR.lower():

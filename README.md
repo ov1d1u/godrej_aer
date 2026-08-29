@@ -8,6 +8,22 @@ This integration currently only supports the following features:
 
 - Trigger the device via a `button` entity
 - Battery level monitoring (in mV)
+- On-demand status refresh via the `godrej_aer.update_status` service
+
+## Services
+
+### `godrej_aer.update_status`
+
+Connects to the device and refreshes its status (battery voltage and
+connection state), bypassing the automatic retry cooldown that applies to
+background polling. Target one or more devices/entities, or call it without
+a target to update every configured device.
+
+```yaml
+action: godrej_aer.update_status
+target:
+  device_id: <your Smart Matic device>
+```
 
 ## Installation
 

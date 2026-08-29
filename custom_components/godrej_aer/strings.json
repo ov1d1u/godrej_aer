@@ -29,5 +29,11 @@
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
     }
+  },
+  "services": {
+    "update_status": {
+      "name": "Update status",
+      "description": "Connects to the Godrej Aer Smart Matic device and refreshes its status. Bypasses the automatic retry cooldown. If no target is given, every configured device is updated."
+    }
   }
 }
