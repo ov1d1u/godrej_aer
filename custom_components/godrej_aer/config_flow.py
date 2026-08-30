@@ -61,14 +61,18 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
             return await self.async_step_validate()
 
+        configured_ids = self._async_current_ids()
         discovered_devices = []
         discovered_infos = async_discovered_service_info(
             self.hass,
             connectable=True
         )
         for device_info in discovered_infos:
-            if self._is_device_supported(device_info):
-                discovered_devices.append(device_info)
+            if not self._is_device_supported(device_info):
+                continue
+            if format_mac(device_info.address) in configured_ids:
+                continue
+            discovered_devices.append(device_info)
 
         device_options = {dev.address: f"{dev.name} ({dev.address})" for dev in discovered_devices}
         device_options[MANUAL_MAC] = "Enter MAC address manually"
