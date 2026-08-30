@@ -145,12 +145,16 @@ class SmartMatic:
         self._disconnect_task: asyncio.Task | None = None
         self._retry_after: datetime | None = None
 
-    async def connect(self) -> bool:
+    async def connect(self, *, require_status: bool = True) -> bool:
         """Open the BLE link and fetch a fresh device status.
 
         Used by the polling path. A status timeout here is treated as a
         connect failure. For just actuating the device (button press) use
         trigger(), which does not depend on the status read.
+
+        With ``require_status=False`` (used by the config flow) a failure to
+        read the status back is logged but not raised: getting the BLE link
+        up and confirming the device looks right is enough.
         """
         async with self._connect_lock:
             await self._open_connection()
@@ -158,9 +162,18 @@ class SmartMatic:
             try:
                 await self._set_time()
                 await self.get_device_status()
-            except BaseException:
+            except (asyncio.CancelledError, InvalidDeviceError):
                 await self._cleanup_connection()
                 raise
+            except BaseException as e:
+                if require_status:
+                    await self._cleanup_connection()
+                    raise
+                _LOGGER.warning(
+                    "Connected to %s but could not read device status: %s",
+                    self.mac, e
+                )
+                await self.delayed_disconnect()
 
         return True
 

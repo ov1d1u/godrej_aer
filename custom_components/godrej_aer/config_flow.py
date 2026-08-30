@@ -36,7 +36,7 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
         return "smart matic" in name.lower()
 
     async def _validate_device(self, smartmatic):
-        if not await smartmatic.connect():
+        if not await smartmatic.connect(require_status=False):
             raise ConnectionError("Unable to connect")
 
     async def async_step_user(
