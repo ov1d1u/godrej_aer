@@ -36,7 +36,12 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
         return "smart matic" in name.lower()
 
     async def _validate_device(self, smartmatic):
-        if not await smartmatic.connect(require_status=False):
+        # Getting the BLE link up and confirming the device looks right is
+        # enough to add it. The status read may not work over every transport
+        # (an ESPHome Bluetooth proxy cannot enable notifications on this
+        # device's status characteristic, which has no CCC descriptor), so a
+        # status timeout here must not block setup - keep the wait short.
+        if not await smartmatic.connect(require_status=False, status_timeout=10):
             raise ConnectionError("Unable to connect")
 
     async def async_step_user(

@@ -21,7 +21,7 @@ from .const import (
     DESIRED_MTU,
 )
 from .eventbus import EventBus
-from .devicestatus import DeviceStatus
+from .devicestatus import DeviceStatus, STATUS_LEN
 from .exception import (
     InvalidDeviceError,
     ConnectionError
@@ -145,7 +145,12 @@ class SmartMatic:
         self._disconnect_task: asyncio.Task | None = None
         self._retry_after: datetime | None = None
 
-    async def connect(self, *, require_status: bool = True) -> bool:
+    async def connect(
+        self,
+        *,
+        require_status: bool = True,
+        status_timeout: float = STATUS_TIMEOUT,
+    ) -> bool:
         """Open the BLE link and fetch a fresh device status.
 
         Used by the polling path. A status timeout here is treated as a
@@ -154,14 +159,15 @@ class SmartMatic:
 
         With ``require_status=False`` (used by the config flow) a failure to
         read the status back is logged but not raised: getting the BLE link
-        up and confirming the device looks right is enough.
+        up and confirming the device looks right is enough. ``status_timeout``
+        caps how long to wait for that status frame.
         """
         async with self._connect_lock:
             await self._open_connection()
 
             try:
                 await self._set_time()
-                await self.get_device_status()
+                await self.get_device_status(timeout=status_timeout)
             except (asyncio.CancelledError, InvalidDeviceError):
                 await self._cleanup_connection()
                 raise
@@ -235,29 +241,68 @@ class SmartMatic:
                             self.mac, char.uuid, ",".join(char.properties)
                         )
 
-            if MAIN_SVC not in [service.uuid for service in services]:
+            main_svc = services.get_service(MAIN_SVC)
+            if main_svc is None:
                 raise InvalidDeviceError("Device does not look right")
 
             self.eventbus.send(DEVICE_CONNECT, self)
 
-            try:
-                _LOGGER.debug("Subscribing to notifications on %s...", NOTIFY_CHAR)
-                await client.start_notify(
-                    NOTIFY_CHAR,
-                    self._notification_handler
-                )
-            except Exception as e:
-                _LOGGER.debug(
-                    "Failed start_notify on %s for %s: %s",
-                    NOTIFY_CHAR, self.mac, e
-                )
-
+            await self._subscribe_notifications(client, main_svc)
             await self._request_mtu()
         except BaseException:
             # Includes asyncio.CancelledError: if the caller's task is
             # cancelled mid-connect we still must not leak the BLE link.
             await self._cleanup_connection()
             raise
+
+    async def _subscribe_notifications(self, client, main_svc):
+        """Subscribe to every notify characteristic in the main service.
+
+        The device is Nordic UART-style, but its firmware is inconsistent
+        about *which* characteristic carries the 99-byte status frame and
+        about whether a given one exposes the Client Characteristic Config
+        descriptor (CCCD) that strict BLE stacks require - the ESPHome
+        Bluetooth proxy (connection v3) refuses ``start_notify`` on a
+        characteristic without one:
+
+            Characteristic 6e400001-... does not have a characteristic
+            client config descriptor.
+
+        Rather than hard-code one channel, subscribe to all of them and let
+        ``_notification_handler`` pick the status frame out of whichever one
+        actually delivers it. As long as a single subscription succeeds we
+        can receive status updates.
+        """
+        notify_chars = [
+            char for char in main_svc.characteristics
+            if "notify" in char.properties or "indicate" in char.properties
+        ]
+        # Try the conventional Nordic UART TX characteristic first.
+        notify_chars.sort(key=lambda c: c.uuid.lower() != NOTIFY_CHAR.lower())
+
+        subscribed = 0
+        for char in notify_chars:
+            try:
+                _LOGGER.debug("Subscribing to notifications on %s...", char.uuid)
+                await client.start_notify(char, self._notification_handler)
+                subscribed += 1
+            except Exception as e:
+                _LOGGER.debug(
+                    "Failed start_notify on %s for %s: %s",
+                    char.uuid, self.mac, e
+                )
+
+        if subscribed:
+            _LOGGER.debug(
+                "Subscribed to %d/%d notify characteristic(s) on %s",
+                subscribed, len(notify_chars), self.mac
+            )
+        else:
+            _LOGGER.warning(
+                "Could not subscribe to any notify characteristic on %s; "
+                "device status updates will not be received",
+                self.mac
+            )
 
     async def _request_mtu(self):
         """Negotiate a larger ATT MTU, mirroring the official app.
@@ -401,9 +446,9 @@ class SmartMatic:
         # Match the app's pacing between messages.
         await asyncio.sleep(1.0)
 
-    async def get_device_status(self):
+    async def get_device_status(self, *, timeout: float = STATUS_TIMEOUT):
         _LOGGER.debug("Getting device status from %s...", self.mac)
-        
+
         # Reset the event before waiting for new status
         self._device_status_event.clear()
 
@@ -412,16 +457,16 @@ class SmartMatic:
 
         try:
             _LOGGER.debug("Waiting for device status from %s...", self.mac)
-            
+
             await asyncio.wait_for(
                 self._device_status_event.wait(),
-                STATUS_TIMEOUT
+                timeout
             )
         except asyncio.TimeoutError as exc:
             _LOGGER.warning(
                 "Timeout waiting for device status from %s after %ss",
                 self.mac,
-                STATUS_TIMEOUT
+                timeout
             )
             raise ConnectionError(
                 f"Timeout waiting for device status response from {self.mac}"
@@ -508,12 +553,23 @@ class SmartMatic:
             await self._open_connection()
 
     async def _notification_handler(self, sender, data):
-        if sender.uuid.lower() == NOTIFY_CHAR.lower():
-            _LOGGER.debug("<< %s: %s", sender.uuid, data.hex())
-            if len(data) == 99:
-                self.device_status = DeviceStatus(data)
-                self._device_status_event.set()
-                self.eventbus.send(DEVICE_STATUS_UPDATE, self.device_status)
+        uuid = getattr(sender, "uuid", sender)
+        _LOGGER.debug("<< %s: %s", uuid, data.hex())
+
+        # The status frame is a fixed 99 bytes. We subscribe to every notify
+        # characteristic (see _subscribe_notifications), so match on the
+        # frame shape rather than the source characteristic.
+        if len(data) != STATUS_LEN:
+            return
+
+        status = DeviceStatus(bytes(data))
+        if not status.is_valid:
+            _LOGGER.debug("Ignoring malformed status frame from %s", self.mac)
+            return
+
+        self.device_status = status
+        self._device_status_event.set()
+        self.eventbus.send(DEVICE_STATUS_UPDATE, self.device_status)
 
     def _on_disconnect(self, _client: BleakClient):
         if self._disconnect_task is not None:

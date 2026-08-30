@@ -1,6 +1,10 @@
 """Device- and BLE-connection constants for the Godrej Aer Smart Matic."""
 
 # Nordic UART-style GATT service and characteristics exposed by the device.
+# The device's firmware is inconsistent about which characteristic actually
+# carries the status notification (and whether it exposes a CCC descriptor),
+# so the code subscribes to *every* notify characteristic in MAIN_SVC and
+# tries NOTIFY_CHAR first. See SmartMatic._subscribe_notifications.
 MAIN_SVC = "6e400000-b5a3-f393-e0a9-e50e24dcca9e"
 NOTIFY_CHAR = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 WRITE_CHAR = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
