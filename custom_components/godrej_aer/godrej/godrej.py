@@ -155,7 +155,7 @@ class SmartMatic:
 
         Used by the polling path. A status timeout here is treated as a
         connect failure. For just actuating the device (button press) use
-        trigger(), which does not depend on the status read.
+        spray_now(), which does not depend on the status read.
 
         With ``require_status=False`` (used by the config flow) a failure to
         read the status back is logged but not raised: getting the BLE link
@@ -179,7 +179,8 @@ class SmartMatic:
                     "Connected to %s but could not read device status: %s",
                     self.mac, e
                 )
-                await self.delayed_disconnect()
+
+            await self.delayed_disconnect()
 
         return True
 
@@ -402,7 +403,7 @@ class SmartMatic:
         except Exception as e:
             _LOGGER.debug("Error while cleaning up connection to %s: %s", self.mac, e)
 
-    async def delayed_disconnect(self):
+    async def delayed_disconnect(self, *, refresh: bool = False):
         async def _delayed_disconnect():
             if not self.client or not self.client.is_connected:
                 _LOGGER.debug("%s already disconnected, skipping delayed disconnect.", self.mac)
@@ -411,6 +412,14 @@ class SmartMatic:
             try:
                 _LOGGER.debug("Waiting %ss before disconnecting from %s...", DISCONNECT_DELAY, self.mac)
                 await asyncio.sleep(DISCONNECT_DELAY)
+                if refresh:
+                    try:
+                        await self.get_device_status()
+                    except Exception as e:
+                        _LOGGER.warning(
+                            "Status refresh after action on %s failed: %s",
+                            self.mac, e
+                        )
                 await self.disconnect()
             except Exception as e:
                 _LOGGER.debug("Failed to disconnect. Error: %s", e)
@@ -475,35 +484,26 @@ class SmartMatic:
         # Got a fresh status, clear any retry cooldown from earlier failures.
         self._retry_after = None
 
-        await self.delayed_disconnect()
-
     async def _write_action(self, payload: bytes, *, refresh: bool = True):
         """Send a command that changes device state.
 
-        Connects if needed, writes the message, then (by default) reads
-        the status back so entity state reflects reality. The command has
-        already been delivered by the time a status refresh fails, so that
-        failure is logged, not raised.
+        Connects if needed and writes the message immediately. By default,
+        refreshes status just before the delayed disconnect, so the action
+        returns without waiting for a status response.
         """
         await self._ensure_connected()
 
-        _LOGGER.debug(">> %s: %s", WRITE_CHAR, payload.hex())
-        await self.client.write_gatt_char(WRITE_CHAR, payload)
-        _LOGGER.debug("Write complete.")
+        # Stop a pending refresh/disconnect while sending the next command.
+        if self._disconnect_task is not None:
+            self._disconnect_task.cancel()
+            self._disconnect_task = None
 
-        if not refresh:
-            await self.delayed_disconnect()
-            return
-
-        # Give the device a moment to apply the change before reading back.
-        await asyncio.sleep(2.0)
         try:
-            await self.get_device_status()
-        except Exception as e:
-            _LOGGER.warning(
-                "Status refresh after action on %s failed: %s", self.mac, e
-            )
-            await self.delayed_disconnect()
+            _LOGGER.debug(">> %s: %s", WRITE_CHAR, payload.hex())
+            await self.client.write_gatt_char(WRITE_CHAR, payload)
+            _LOGGER.debug("Write complete.")
+        finally:
+            await self.delayed_disconnect(refresh=refresh)
 
     async def spray_now(self):
         """Spray once, now."""
