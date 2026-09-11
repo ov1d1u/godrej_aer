@@ -18,7 +18,6 @@ from .const import (
     WRITE_CHAR,
     SPRAY_INTERVALS,
     DEFAULT_SPRAY_INTERVAL,
-    DESIRED_MTU,
 )
 from .eventbus import EventBus
 from .devicestatus import DeviceStatus, STATUS_LEN
@@ -249,7 +248,6 @@ class SmartMatic:
             self.eventbus.send(DEVICE_CONNECT, self)
 
             await self._subscribe_notifications(client, main_svc)
-            await self._request_mtu()
         except BaseException:
             # Includes asyncio.CancelledError: if the caller's task is
             # cancelled mid-connect we still must not leak the BLE link.
@@ -304,41 +302,6 @@ class SmartMatic:
                 "device status updates will not be received",
                 self.mac
             )
-
-    async def _request_mtu(self):
-        """Negotiate a larger ATT MTU, mirroring the official app.
-
-        Best effort only. Which of these works depends on the bleak
-        backend: BlueZ negotiates automatically and exposes only a way to
-        force the exchange early; CoreBluetooth and ESPHome proxies size
-        the MTU themselves. A failure here is harmless, so it is only
-        logged.
-        """
-        client = self.client
-        if client is None:
-            return
-
-        try:
-            request_mtu = getattr(client, "request_mtu", None)
-            if request_mtu is not None:
-                # Not in bleak's public API today, but some wrappers add it.
-                await request_mtu(DESIRED_MTU)
-            else:
-                backend = getattr(client, "_backend", None)
-                # BlueZ: force the MTU exchange that would otherwise be lazy.
-                negotiate = (
-                    getattr(backend, "_acquire_mtu", None)
-                    or getattr(backend, "_negotiate_mtu", None)
-                )
-                if negotiate is not None:
-                    await negotiate()
-        except Exception as e:
-            _LOGGER.debug("MTU negotiation with %s failed: %s", self.mac, e)
-
-        try:
-            _LOGGER.debug("MTU for %s is %s", self.mac, client.mtu_size)
-        except Exception:
-            pass
 
     async def connect_if_needed(self) -> bool:
         if self.device_status and self.device_status.is_valid:

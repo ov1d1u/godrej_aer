@@ -24,8 +24,3 @@ SPRAY_INTERVALS = (10, 20, 40)
 DEFAULT_SPRAY_INTERVAL = 10
 # Sprays a full cartridge is rated for; used to derive a refill percentage.
 SPRAY_CAPACITY = 2200
-
-# ATT MTU to request after connecting, matching the official app. The
-# 99-byte status frame needs an MTU of at least ~102 to arrive in a single
-# notification; the default of 23 would truncate it.
-DESIRED_MTU = 185
