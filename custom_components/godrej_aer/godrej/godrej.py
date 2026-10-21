@@ -561,19 +561,17 @@ class SmartMatic:
         return True
 
     def _command_char_candidates(self) -> list[str]:
+        """Every writable characteristic in the main service, known ones first."""
         main_svc = self.client.services.get_service(MAIN_SVC) if self.client else None
         if main_svc is None:
             return list(COMMAND_CHAR_CANDIDATES)
 
-        candidates = []
-        for uuid in COMMAND_CHAR_CANDIDATES:
-            char = main_svc.get_characteristic(uuid)
-            if char is not None and (
-                "write" in char.properties
-                or "write-without-response" in char.properties
-            ):
-                candidates.append(uuid)
-        return candidates
+        writable = [
+            char.uuid.lower() for char in main_svc.characteristics
+            if "write" in char.properties or "write-without-response" in char.properties
+        ]
+        known = [uuid for uuid in COMMAND_CHAR_CANDIDATES if uuid in writable]
+        return known + [uuid for uuid in writable if uuid not in known]
 
     async def _detect_command_char(
         self,

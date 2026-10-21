@@ -10,7 +10,8 @@ MAIN_SVC = "6e400000-b5a3-f393-e0a9-e50e24dcca9e"
 NOTIFY_CHAR = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 
 # Command characteristic per firmware: 6e400002 (original),
-# 6e400003 (3.0.6-T1), 6e400004 (3.0.8-IN). Probed in this order.
+# 6e400003 (3.0.6-T1), 6e400004 (3.0.8-IN). Detection probes every writable
+# characteristic in MAIN_SVC, these first and in this order.
 COMMAND_CHAR_CANDIDATES = (
     "6e400002-b5a3-f393-e0a9-e50e24dcca9e",
     "6e400003-b5a3-f393-e0a9-e50e24dcca9e",
