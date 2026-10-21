@@ -166,6 +166,8 @@ class SmartMatic:
         self._command_char: str | None = command_char
         self._on_command_char_detected = on_command_char_detected
         self._failure_logged = False
+        self._subscribed = False
+        self._subscribe_lock = asyncio.Lock()
         # uuid -> (partial frame, time of last fragment)
         self._rx_buffers: dict[str, tuple[bytearray, float]] = {}
 
@@ -193,8 +195,8 @@ class SmartMatic:
 
         return True
 
-    async def _open_connection(self):
-        """Establish the BLE link and subscribe to notifications.
+    async def _open_connection(self, *, subscribe: bool = True):
+        """Establish the BLE link and (by default) subscribe to notifications.
 
         The caller must hold ``self._connect_lock``. On any failure after
         the link is up, the connection is torn down before the exception
@@ -205,6 +207,8 @@ class SmartMatic:
 
         if self.client and self.client.is_connected:
             _LOGGER.debug("Already connected to %s", self.mac)
+            if subscribe:
+                await self._ensure_subscribed()
             return
 
         device = async_ble_device_from_address(
@@ -228,6 +232,7 @@ class SmartMatic:
             raise ConnectionError(f"Failed to connect to device: {e}") from e
 
         self.client = client
+        self._subscribed = False
 
         # From here on the BLE link is open. Any failure must disconnect
         # it, otherwise we stay connected indefinitely and drain the
@@ -257,8 +262,8 @@ class SmartMatic:
 
             self.eventbus.send(DEVICE_CONNECT, self)
 
-            await self._subscribe_notifications(client, main_svc)
-            await self._request_mtu()
+            if subscribe:
+                await self._ensure_subscribed()
         except BaseException:
             # Includes asyncio.CancelledError: if the caller's task is
             # cancelled mid-connect we still must not leak the BLE link.
@@ -316,6 +321,18 @@ class SmartMatic:
                 "device status updates will not be received",
                 self.mac
             )
+
+    async def _ensure_subscribed(self):
+        """Subscribe to notifications once per connection."""
+        async with self._subscribe_lock:
+            client = self.client
+            if self._subscribed or client is None:
+                return
+            await self._subscribe_notifications(
+                client, client.services.get_service(MAIN_SVC)
+            )
+            await self._request_mtu()
+            self._subscribed = True
 
     async def _raw_proxy_notify(self, client, char) -> bool:
         """Subscribe via an ESPHome proxy without writing a CCCD.
@@ -651,6 +668,7 @@ class SmartMatic:
         # Give the device a moment to apply the change before reading back.
         await asyncio.sleep(2.0)
         try:
+            await self._ensure_subscribed()
             await self.get_device_status()
         except Exception as e:
             _LOGGER.warning(
@@ -703,7 +721,8 @@ class SmartMatic:
 
         async with self._connect_lock:
             _LOGGER.debug("Not connected, connecting to %s...", self.mac)
-            await self._open_connection()
+            # Subscribing takes seconds; the command doesn't need it.
+            await self._open_connection(subscribe=False)
 
     async def _notification_handler(self, sender, data):
         self._on_notification(getattr(sender, "uuid", str(sender)), data)
