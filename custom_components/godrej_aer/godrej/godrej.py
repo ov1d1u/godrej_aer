@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import time
-from collections.abc import Callable
 from datetime import datetime, timedelta
 from bleak import BleakClient
 from bleak_retry_connector import establish_connection
@@ -149,13 +148,10 @@ class SmartMatic:
         mac,
         *,
         command_char: str | None = None,
-        on_command_char_detected: Callable[[str], None] | None = None,
         reply_char: str | None = None,
-        on_reply_char_detected: Callable[[str], None] | None = None,
     ):
-        """If ``command_char`` is None it is detected on the next status
-        read and passed to ``on_command_char_detected``; likewise
-        ``reply_char``, the characteristic status replies arrive on."""
+        """``command_char``/``reply_char`` are the characteristics found by
+        detect_channels(). Without them the historical defaults are used."""
         self.hass = hass
         self.mac = mac
         self.client: BleakClient | None = None
@@ -168,12 +164,12 @@ class SmartMatic:
         self._retry_after: datetime | None = None
 
         self._command_char: str | None = command_char
-        self._on_command_char_detected = on_command_char_detected
         self._failure_logged = False
+        self._missing_channel_logged = False
         self._subscribed = False
         self._subscribe_lock = asyncio.Lock()
         self._reply_char: str | None = reply_char
-        self._on_reply_char_detected = on_reply_char_detected
+        self._last_reply_char: str | None = None
         self._refresh_task: asyncio.Task | None = None
         # uuid -> (partial frame, time of last fragment)
         self._rx_buffers: dict[str, tuple[bytearray, float]] = {}
@@ -196,9 +192,7 @@ class SmartMatic:
             await self._open_connection()
 
             try:
-                # Detection sets the time itself once it finds the channel.
-                if self._command_char is not None:
-                    await self._set_time()
+                await self._set_time()
                 await self.get_device_status(timeout=status_timeout)
             except BaseException:
                 await self._cleanup_connection()
@@ -328,11 +322,6 @@ class SmartMatic:
                 )
                 if await self._raw_proxy_notify(client, char):
                     subscribed += 1
-
-        if not subscribed and known:
-            _LOGGER.debug("Could not subscribe to %s; trying all", self._reply_char)
-            self._reply_char = None
-            return await self._subscribe_notifications(client, main_svc)
 
         if subscribed:
             _LOGGER.debug(
@@ -471,24 +460,29 @@ class SmartMatic:
             self._failure_logged = False
         return True
 
-    async def detect_command_channel(
+    async def detect_channels(
         self, *, timeout: float = STATUS_TIMEOUT
-    ) -> str | None:
-        """Connect, detect the command channel, and disconnect.
+    ) -> tuple[str, str] | None:
+        """Find the command and reply characteristics on a fresh link.
 
-        Returns None if the device is reachable but never answers.
+        Returns None if the device is reachable but never answers. The
+        channels this instance uses are left unchanged.
         """
         async with self._connect_lock:
+            saved = self._command_char, self._reply_char
+            # Start clean so every notify characteristic gets subscribed.
+            await self._cleanup_connection()
+            self._command_char = self._reply_char = self._last_reply_char = None
             try:
                 await self._open_connection()
-                self._command_char = None
                 try:
-                    await self._detect_command_char(timeout=timeout)
+                    command = await self._detect_command_char(timeout=timeout)
                 except ConnectionError as e:
                     _LOGGER.warning("Could not detect the command channel: %s", e)
                     return None
-                return self._command_char
+                return command, self._last_reply_char
             finally:
+                self._command_char, self._reply_char = saved
                 await self._cleanup_connection()
 
     async def disconnect(self):
@@ -573,10 +567,8 @@ class SmartMatic:
     async def get_device_status(self, *, timeout: float = STATUS_TIMEOUT):
         _LOGGER.debug("Getting device status from %s...", self.mac)
 
-        if self._command_char is None:
-            await self._detect_command_char(timeout=timeout)
-        elif not await self._request_status(self._command_char, timeout):
-            # Keep the channel: a weak link is likelier than new firmware.
+        self._warn_if_not_detected()
+        if not await self._request_status(self._write_char, timeout):
             raise ConnectionError(
                 f"Timeout waiting for device status response from {self.mac}"
             )
@@ -644,22 +636,14 @@ class SmartMatic:
                 if set_time_first:
                     await self._set_time(char)
                 if await self._request_status(char, min(PROBE_TIMEOUT, remaining)):
-                    self._command_char = char
                     _LOGGER.info(
-                        "Using %s as command channel for %s (firmware %s)",
-                        char, self.mac,
+                        "Command channel for %s is %s, replies on %s (firmware %s)",
+                        self.mac, char, self._last_reply_char,
                         self.device_status.firmware_version if self.device_status else "?"
                     )
-                    if self._on_command_char_detected is not None:
-                        try:
-                            self._on_command_char_detected(char)
-                        except Exception:
-                            _LOGGER.exception(
-                                "Could not store the command channel for %s", self.mac
-                            )
                     if not set_time_first:
-                        await self._set_time()
-                    return
+                        await self._set_time(char)
+                    return char
 
         raise ConnectionError(
             f"No status reply from {self.mac} on any of {', '.join(candidates)}"
@@ -675,24 +659,26 @@ class SmartMatic:
         """
         await self._ensure_connected()
 
-        # Actions never probe.
-        if self._command_char is None:
-            _LOGGER.warning(
-                "Command channel for %s not known yet; sending to %s",
-                self.mac, self._write_char
-            )
+        self._warn_if_not_detected()
 
         char = self._write_char
         _LOGGER.debug(">> %s: %s", char, payload.hex())
         await self.client.write_gatt_char(char, payload)
         _LOGGER.debug("Write complete.")
 
-        # A read-back would run detection inside the button press.
-        if not refresh or self._command_char is None:
+        if not refresh:
             await self.delayed_disconnect()
             return
 
         self._schedule_refresh()
+
+    def _warn_if_not_detected(self):
+        if self._command_char is None and not self._missing_channel_logged:
+            self._missing_channel_logged = True
+            _LOGGER.warning(
+                "Command channel for %s has not been detected; using %s. "
+                "Reconfigure the device to detect it.", self.mac, WRITE_CHAR
+            )
 
     def _schedule_refresh(self):
         """Read the status back in the background after an action.
@@ -810,16 +796,8 @@ class SmartMatic:
             _LOGGER.debug("Ignoring non-status message from %s", self.mac)
             return
 
-        if uuid is not None and self._reply_char is None:
-            _LOGGER.debug("Status replies from %s arrive on %s", self.mac, uuid)
-            self._reply_char = uuid
-            if self._on_reply_char_detected is not None:
-                try:
-                    self._on_reply_char_detected(uuid)
-                except Exception:
-                    _LOGGER.exception(
-                        "Could not store the reply channel for %s", self.mac
-                    )
+        if uuid is not None:
+            self._last_reply_char = uuid
 
         self.device_status = status
         self._device_status_event.set()

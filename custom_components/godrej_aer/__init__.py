@@ -31,21 +31,11 @@ async def async_setup_entry(
 
     mac = entry.options.get(CONF_MAC, None) or entry.data.get(CONF_MAC, None)
 
-    def _store(key: str):
-        @callback
-        def _update(value: str) -> None:
-            hass.config_entries.async_update_entry(
-                entry, data={**entry.data, key: value}
-            )
-        return _update
-
     instance = SmartMatic(
         hass,
         mac,
         command_char=entry.data.get(CONF_COMMAND_CHAR),
-        on_command_char_detected=_store(CONF_COMMAND_CHAR),
         reply_char=entry.data.get(CONF_REPLY_CHAR),
-        on_reply_char_detected=_store(CONF_REPLY_CHAR),
     )
     entry.runtime_data = instance
 

@@ -1,10 +1,24 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
-from homeassistant.components.sensor import SensorEntity, SensorStateClass
+from homeassistant.components import bluetooth
+from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfElectricPotential, CONF_NAME
+from homeassistant.const import (
+    PERCENTAGE,
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    UnitOfElectricPotential,
+    CONF_NAME,
+    EntityCategory,
+)
+from homeassistant.core import callback
 from homeassistant.helpers.entity import DeviceInfo
 
 from .entity import async_device_device_info_fn
@@ -18,6 +32,15 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         SmartMaticBatteryVoltageSensor(instance, config_entry),
         SmartMaticRefillLevelSensor(instance, config_entry),
         SmartMaticSprayCountSensor(instance, config_entry),
+        SmartMaticChannelSensor(
+            instance, config_entry, "command_channel",
+            "SmartMatic Command Channel", instance.command_char,
+        ),
+        SmartMaticChannelSensor(
+            instance, config_entry, "reply_channel",
+            "SmartMatic Reply Channel", instance.reply_char,
+        ),
+        SmartMaticSignalStrengthSensor(instance, config_entry),
     ])
 
 
@@ -79,3 +102,89 @@ class SmartMaticSprayCountSensor(SmartMaticSensor):
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_icon = "mdi:counter"
     _value_fn = staticmethod(lambda status: status.total_spray_count)
+
+
+class SmartMaticChannelSensor(SensorEntity):
+    """A detected characteristic, fixed until the device is reconfigured."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:bluetooth-settings"
+    _attr_should_poll = False
+
+    def __init__(self, instance, config_entry, key, name, uuid):
+        self._instance = instance
+        self._config_entry = config_entry
+        self._attr_unique_id = f"{config_entry.entry_id}_{key}"
+        self._attr_name = name
+        self._attr_native_value = uuid[:8] if uuid else "not detected"
+        self._attr_extra_state_attributes = {"uuid": uuid}
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return async_device_device_info_fn(
+            self._instance, self._config_entry.data[CONF_NAME]
+        )
+
+
+class SmartMaticSignalStrengthSensor(SensorEntity):
+    """RSSI of the device's advertisements, and which adapter or proxy heard them."""
+
+    _attr_name = "SmartMatic Signal Strength"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_should_poll = False
+
+    # Advertisements arrive several times a second; record changes only.
+    _MIN_INTERVAL = 60
+    _MIN_CHANGE = 5
+
+    def __init__(self, instance: SmartMatic, config_entry: ConfigEntry):
+        self._instance = instance
+        self._config_entry = config_entry
+        self._attr_unique_id = f"{config_entry.entry_id}_signal_strength"
+        self._last_write = 0.0
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return async_device_device_info_fn(
+            self._instance, self._config_entry.data[CONF_NAME]
+        )
+
+    async def async_added_to_hass(self) -> None:
+        mac = self._instance.mac
+        info = bluetooth.async_last_service_info(self.hass, mac, connectable=True)
+        if info is not None:
+            self._update(info)
+            self.async_write_ha_state()
+        self.async_on_remove(
+            bluetooth.async_register_callback(
+                self.hass,
+                self._on_advertisement,
+                BluetoothCallbackMatcher({ADDRESS: mac}),
+                bluetooth.BluetoothScanningMode.PASSIVE,
+            )
+        )
+
+    @callback
+    def _on_advertisement(self, info, change) -> None:
+        previous = self._attr_native_value
+        if (
+            previous is not None
+            and info.source == (self._attr_extra_state_attributes or {}).get("source")
+            and abs(info.rssi - previous) < self._MIN_CHANGE
+            and time.monotonic() - self._last_write < self._MIN_INTERVAL
+        ):
+            return
+        self._update(info)
+        self.async_write_ha_state()
+
+    def _update(self, info) -> None:
+        scanner = bluetooth.async_scanner_by_source(self.hass, info.source)
+        self._attr_native_value = info.rssi
+        self._attr_extra_state_attributes = {
+            "source": info.source,
+            "source_name": getattr(scanner, "name", None),
+        }
+        self._last_write = time.monotonic()

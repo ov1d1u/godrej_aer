@@ -75,15 +75,18 @@ on `6e400001-…`:
 | 3.0.8-IN | `6e400004-…` |
 
 When you add a device, the integration sends the (read-only) fetch-status
-request to each of these in turn and stores the one that answers with the
-device, so no configuration is needed and the device is never probed again.
-If the device is reachable but does not answer on any of them, you are asked
-to pick the channel or leave it to be detected on the next connection.
-Devices added with an older version of the integration are detected once,
-on their first connection, and the result is stored the same way.
+request to each of these in turn. It stores the one that answers, together
+with the characteristic the reply arrived on, so no configuration is needed
+and later connections subscribe only where replies arrive. If the device
+doesn't answer, nothing is stored and you can try again.
 
-To see the stored channel, change it, or have it detected again (for example
-after a firmware update), open the integration's **Configure** dialog.
+To detect both again, for example after a firmware update, use
+**Reconfigure** on the integration entry. Devices added with an older version
+keep the previous behaviour (`6e400002`) until they are reconfigured.
+
+The detected characteristics and the signal strength of the device's
+advertisements (with the adapter or proxy that received them) are shown as
+diagnostic sensors on the device page.
 
 `6e400001-…` has no Client Characteristic Configuration descriptor, which
 the ESPHome Bluetooth proxy normally requires before forwarding
