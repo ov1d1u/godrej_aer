@@ -20,7 +20,13 @@ from homeassistant.components.bluetooth import (
     async_discovered_service_info
 )
 
-from .const import CHANNEL_CHOICES, CHANNEL_DETECT, CONF_COMMAND_CHAR, DOMAIN
+from .const import (
+    CHANNEL_CHOICES,
+    CHANNEL_DETECT,
+    CONF_COMMAND_CHAR,
+    CONF_REPLY_CHAR,
+    DOMAIN,
+)
 from .godrej import SmartMatic
 from .godrej.exception import InvalidDeviceError, ConnectionError
 
@@ -36,6 +42,7 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
         self.name = "Godrej Aer Smart Matic"
         self.mac = None
         self.command_char = None
+        self.reply_char = None
         self._manual_entry = False
 
     @staticmethod
@@ -134,6 +141,7 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
         smartmatic = SmartMatic(self.hass, self.mac)
         try:
             self.command_char = await self._validate_device(smartmatic)
+            self.reply_char = smartmatic.reply_char
         except InvalidDeviceError:
             error = "invalid_device"
         except ConnectionError:
@@ -185,6 +193,7 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_MAC: self.mac,
                     CONF_NAME: self.name,
                     CONF_COMMAND_CHAR: self.command_char,
+                    CONF_REPLY_CHAR: self.reply_char,
                 }
             )
 
@@ -210,11 +219,12 @@ class GodrejAerOptionsFlow(OptionsFlow):
         if user_input is not None:
             choice = user_input[CONF_COMMAND_CHAR]
             command_char = None if choice == CHANNEL_DETECT else choice
-            if command_char != self._entry.data.get(CONF_COMMAND_CHAR):
-                self.hass.config_entries.async_update_entry(
-                    self._entry,
-                    data={**self._entry.data, CONF_COMMAND_CHAR: command_char},
-                )
+            data = {**self._entry.data, CONF_COMMAND_CHAR: command_char}
+            if command_char is None:
+                # Detecting again: new firmware may reply elsewhere too.
+                data[CONF_REPLY_CHAR] = None
+            if data != dict(self._entry.data):
+                self.hass.config_entries.async_update_entry(self._entry, data=data)
                 self.hass.config_entries.async_schedule_reload(self._entry.entry_id)
             return self.async_create_entry(data=dict(self._entry.options))
 

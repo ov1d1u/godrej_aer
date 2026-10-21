@@ -150,9 +150,12 @@ class SmartMatic:
         *,
         command_char: str | None = None,
         on_command_char_detected: Callable[[str], None] | None = None,
+        reply_char: str | None = None,
+        on_reply_char_detected: Callable[[str], None] | None = None,
     ):
         """If ``command_char`` is None it is detected on the next status
-        read and passed to ``on_command_char_detected``."""
+        read and passed to ``on_command_char_detected``; likewise
+        ``reply_char``, the characteristic status replies arrive on."""
         self.hass = hass
         self.mac = mac
         self.client: BleakClient | None = None
@@ -169,7 +172,8 @@ class SmartMatic:
         self._failure_logged = False
         self._subscribed = False
         self._subscribe_lock = asyncio.Lock()
-        self._reply_char: str | None = None
+        self._reply_char: str | None = reply_char
+        self._on_reply_char_detected = on_reply_char_detected
         self._refresh_task: asyncio.Task | None = None
         # uuid -> (partial frame, time of last fragment)
         self._rx_buffers: dict[str, tuple[bytearray, float]] = {}
@@ -177,6 +181,10 @@ class SmartMatic:
     @property
     def command_char(self) -> str | None:
         return self._command_char
+
+    @property
+    def reply_char(self) -> str | None:
+        return self._reply_char
 
     @property
     def _write_char(self) -> str:
@@ -805,6 +813,13 @@ class SmartMatic:
         if uuid is not None and self._reply_char is None:
             _LOGGER.debug("Status replies from %s arrive on %s", self.mac, uuid)
             self._reply_char = uuid
+            if self._on_reply_char_detected is not None:
+                try:
+                    self._on_reply_char_detected(uuid)
+                except Exception:
+                    _LOGGER.exception(
+                        "Could not store the reply channel for %s", self.mac
+                    )
 
         self.device_status = status
         self._device_status_event.set()
