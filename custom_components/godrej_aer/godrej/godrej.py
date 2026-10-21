@@ -24,6 +24,7 @@ from .const import (
     SPRAY_INTERVALS,
     DEFAULT_SPRAY_INTERVAL,
     DESIRED_MTU,
+    ACTION_SETTLE,
 )
 from .eventbus import EventBus
 from .devicestatus import DeviceStatus
@@ -168,6 +169,8 @@ class SmartMatic:
         self._failure_logged = False
         self._subscribed = False
         self._subscribe_lock = asyncio.Lock()
+        self._reply_char: str | None = None
+        self._refresh_task: asyncio.Task | None = None
         # uuid -> (partial frame, time of last fragment)
         self._rx_buffers: dict[str, tuple[bytearray, float]] = {}
 
@@ -195,7 +198,9 @@ class SmartMatic:
 
         return True
 
-    async def _open_connection(self, *, subscribe: bool = True):
+    async def _open_connection(
+        self, *, subscribe: bool = True, settle: float = 2.0
+    ):
         """Establish the BLE link and (by default) subscribe to notifications.
 
         The caller must hold ``self._connect_lock``. On any failure after
@@ -238,7 +243,7 @@ class SmartMatic:
         # it, otherwise we stay connected indefinitely and drain the
         # device battery.
         try:
-            await asyncio.sleep(2.0)  # give some time for service discovery
+            await asyncio.sleep(settle)  # let the device settle after connecting
 
             if not client.is_connected:
                 raise ConnectionError(
@@ -295,6 +300,12 @@ class SmartMatic:
         # Try the conventional Nordic UART TX characteristic first.
         notify_chars.sort(key=lambda c: c.uuid.lower() != NOTIFY_CHAR.lower())
 
+        # Each subscription takes seconds through a proxy: once a status
+        # reply has arrived, subscribe only where it came from.
+        known = [c for c in notify_chars if c.uuid == self._reply_char]
+        if known:
+            notify_chars = known
+
         self._rx_buffers.clear()
         subscribed = 0
         for char in notify_chars:
@@ -309,6 +320,11 @@ class SmartMatic:
                 )
                 if await self._raw_proxy_notify(client, char):
                     subscribed += 1
+
+        if not subscribed and known:
+            _LOGGER.debug("Could not subscribe to %s; trying all", self._reply_char)
+            self._reply_char = None
+            return await self._subscribe_notifications(client, main_svc)
 
         if subscribed:
             _LOGGER.debug(
@@ -468,6 +484,9 @@ class SmartMatic:
                 await self._cleanup_connection()
 
     async def disconnect(self):
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+            self._refresh_task = None
         if self.client and self.client.is_connected:
             _LOGGER.debug("Disconnecting from %s...", self.mac)
             await self.client.disconnect()
@@ -665,16 +684,32 @@ class SmartMatic:
             await self.delayed_disconnect()
             return
 
-        # Give the device a moment to apply the change before reading back.
-        await asyncio.sleep(2.0)
-        try:
-            await self._ensure_subscribed()
-            await self.get_device_status()
-        except Exception as e:
-            _LOGGER.warning(
-                "Status refresh after action on %s failed: %s", self.mac, e
-            )
-            await self.delayed_disconnect()
+        self._schedule_refresh()
+
+    def _schedule_refresh(self):
+        """Read the status back in the background after an action.
+
+        The press returns once the command is written; presses in quick
+        succession share one read-back.
+        """
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+
+        async def _refresh():
+            # Give the device a moment to apply the change.
+            await asyncio.sleep(2.0)
+            try:
+                await self._ensure_subscribed()
+                await self.get_device_status()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                _LOGGER.warning(
+                    "Status refresh after action on %s failed: %s", self.mac, e
+                )
+                await self.delayed_disconnect()
+
+        self._refresh_task = asyncio.get_running_loop().create_task(_refresh())
 
     async def spray_now(self):
         """Spray once, now."""
@@ -716,13 +751,19 @@ class SmartMatic:
         notifications are currently not coming back, and it ignores the
         polling retry cooldown.
         """
+        # Don't let a disconnect timer from the last exchange drop the link
+        # mid-command; the action schedules a new one.
+        if self._disconnect_task is not None:
+            self._disconnect_task.cancel()
+            self._disconnect_task = None
+
         if self.client and self.client.is_connected:
             return
 
         async with self._connect_lock:
             _LOGGER.debug("Not connected, connecting to %s...", self.mac)
             # Subscribing takes seconds; the command doesn't need it.
-            await self._open_connection(subscribe=False)
+            await self._open_connection(subscribe=False, settle=ACTION_SETTLE)
 
     async def _notification_handler(self, sender, data):
         self._on_notification(getattr(sender, "uuid", str(sender)), data)
@@ -752,14 +793,18 @@ class SmartMatic:
             end = len(buf)
 
         self._rx_buffers.pop(uuid, None)
-        self._handle_message(bytes(buf[:end]))
+        self._handle_message(bytes(buf[:end]), uuid)
 
-    def _handle_message(self, frame: bytes):
+    def _handle_message(self, frame: bytes, uuid: str | None = None):
         status = DeviceStatus(frame)
         if not status.is_valid:
             # e.g. command acks
             _LOGGER.debug("Ignoring non-status message from %s", self.mac)
             return
+
+        if uuid is not None and self._reply_char is None:
+            _LOGGER.debug("Status replies from %s arrive on %s", self.mac, uuid)
+            self._reply_char = uuid
 
         self.device_status = status
         self._device_status_event.set()

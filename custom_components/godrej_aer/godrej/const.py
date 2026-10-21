@@ -27,6 +27,9 @@ DISCONNECT_DELAY = 15
 STATUS_TIMEOUT = 30
 # Seconds to wait for a reply from each candidate while probing.
 PROBE_TIMEOUT = 5
+# Seconds to wait after connecting before sending a button command.
+# Polls wait 2 s, like the official app.
+ACTION_SETTLE = 0.5
 # Seconds to back off polling after a failed connect attempt.
 CONNECT_RETRY_COOLDOWN = 300
 
