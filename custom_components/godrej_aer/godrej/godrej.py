@@ -35,6 +35,7 @@ from .exception import (
 from .events import (
     DEVICE_CONNECT,
     DEVICE_DISCONNECT,
+    DEVICE_REACHABILITY,
     DEVICE_STATUS_UPDATE
 )
 
@@ -172,6 +173,12 @@ class SmartMatic:
         self._reply_char: str | None = reply_char
         self._last_reply_char: str | None = None
         self._refresh_task: asyncio.Task | None = None
+        # Reachability: off only on real trouble, not on the normal
+        # disconnect after each exchange.
+        self.last_update: datetime | None = None
+        self.reachable: bool | None = None
+        self._advertising: bool | None = None
+        self._last_exchange_ok: bool | None = None
         # uuid -> (partial frame, time of last fragment)
         self._rx_buffers: dict[str, tuple[bytearray, float]] = {}
 
@@ -182,6 +189,26 @@ class SmartMatic:
     @property
     def reply_char(self) -> str | None:
         return self._reply_char
+
+    def set_advertising(self, seen: bool) -> None:
+        """Report whether Home Assistant currently sees the device advertise."""
+        self._advertising = seen
+        self._update_reachable()
+
+    def _set_exchange_ok(self, ok: bool) -> None:
+        self._last_exchange_ok = ok
+        if ok:
+            self._advertising = True  # it answered, so it is in range
+        self._update_reachable()
+
+    def _update_reachable(self) -> None:
+        if self._advertising is None and self._last_exchange_ok is None:
+            value = None
+        else:
+            value = self._advertising is not False and self._last_exchange_ok is not False
+        if value != self.reachable:
+            self.reachable = value
+            self.eventbus.send(DEVICE_REACHABILITY, self)
 
     @property
     def _write_char(self) -> str:
@@ -444,6 +471,7 @@ class SmartMatic:
         try:
             await self.connect()
         except Exception as e:
+            self._set_exchange_ok(False)
             self._retry_after = datetime.now() + timedelta(
                 seconds=CONNECT_RETRY_COOLDOWN
             )
@@ -675,7 +703,11 @@ class SmartMatic:
         already been delivered by the time a status refresh fails, so that
         failure is logged, not raised.
         """
-        await self._ensure_connected()
+        try:
+            await self._ensure_connected()
+        except Exception:
+            self._set_exchange_ok(False)
+            raise
 
         self._warn_if_not_detected()
 
@@ -818,6 +850,8 @@ class SmartMatic:
             self._last_reply_char = uuid
 
         self.device_status = status
+        self.last_update = dt_util.utcnow()
+        self._set_exchange_ok(True)
         self._device_status_event.set()
         self.eventbus.send(DEVICE_STATUS_UPDATE, self.device_status)
 

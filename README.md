@@ -98,6 +98,13 @@ Status replies are decoded as CBOR by key, so frames of other lengths (other
 firmware string lengths, extra fields) work, as do frames split over several
 notifications.
 
+To save battery, the integration disconnects after each exchange, so the
+link opening and closing is normal. **Status** shows whether the device is
+actually working: it reads **OK**, and changes to **Unreachable** only if an
+exchange fails or the device stops advertising. Its `last_update` attribute
+shows when the last status arrived. The raw **Bluetooth link** sensor
+(Active/Idle) is disabled by default; enable it to debug connections.
+
 ## Troubleshooting
 
 - **Device Not Found**: Ensure that your Godrej Aer Smart Matic device is powered on and within Bluetooth range. This devices seems to have bad connectivity range, so make sure that the device is pretty close to a Bluetooth proxy.

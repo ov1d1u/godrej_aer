@@ -34,11 +34,11 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         SmartMaticSprayCountSensor(instance, config_entry),
         SmartMaticChannelSensor(
             instance, config_entry, "command_channel",
-            "SmartMatic Command Channel", instance.command_char,
+            "Command channel", instance.command_char,
         ),
         SmartMaticChannelSensor(
             instance, config_entry, "reply_channel",
-            "SmartMatic Reply Channel", instance.reply_char,
+            "Reply channel", instance.reply_char,
         ),
         SmartMaticSignalStrengthSensor(instance, config_entry),
     ])
@@ -107,6 +107,7 @@ class SmartMaticSprayCountSensor(SmartMaticSensor):
 class SmartMaticChannelSensor(SensorEntity):
     """A detected characteristic, fixed until the device is reconfigured."""
 
+    _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_icon = "mdi:bluetooth-settings"
     _attr_should_poll = False
@@ -129,7 +130,8 @@ class SmartMaticChannelSensor(SensorEntity):
 class SmartMaticSignalStrengthSensor(SensorEntity):
     """RSSI of the device's advertisements, and which adapter or proxy heard them."""
 
-    _attr_name = "SmartMatic Signal Strength"
+    _attr_has_entity_name = True
+    _attr_name = "Signal strength"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
     _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
@@ -188,3 +190,4 @@ class SmartMaticSignalStrengthSensor(SensorEntity):
             "source_name": getattr(scanner, "name", None),
         }
         self._last_write = time.monotonic()
+

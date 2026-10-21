@@ -47,5 +47,21 @@
       "name": "Update status",
       "description": "Connects to the Godrej Aer Smart Matic device and refreshes its status. Bypasses the automatic retry cooldown. If no target is given, every configured device is updated."
     }
+  },
+  "entity": {
+    "binary_sensor": {
+      "bluetooth_link": {
+        "state": {
+          "on": "Active",
+          "off": "Idle"
+        }
+      },
+      "status": {
+        "state": {
+          "on": "OK",
+          "off": "Unreachable"
+        }
+      }
+    }
   }
 }

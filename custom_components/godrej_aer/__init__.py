@@ -62,7 +62,15 @@ async def async_setup_entry(
     ):
         """Subscribe to bluetooth changes."""
         _LOGGER.debug("New service_info: %s", service_info)
+        instance.set_advertising(True)
         _schedule_connect()
+
+    @callback
+    def _async_device_unavailable(
+        service_info: bluetooth.BluetoothServiceInfoBleak,
+    ) -> None:
+        # No advertisements for a while: out of range or out of battery.
+        instance.set_advertising(False)
 
     entry.async_on_unload(
         bluetooth.async_register_callback(
@@ -70,6 +78,11 @@ async def async_setup_entry(
             _async_discovered_device,
             BluetoothCallbackMatcher({ADDRESS: mac}),
             bluetooth.BluetoothScanningMode.PASSIVE
+        )
+    )
+    entry.async_on_unload(
+        bluetooth.async_track_unavailable(
+            hass, _async_device_unavailable, mac, connectable=True
         )
     )
 
