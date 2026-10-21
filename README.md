@@ -75,13 +75,14 @@ on `6e400001-…`:
 | 3.0.8-IN | `6e400004-…` |
 
 When you add a device, the integration sends the (read-only) fetch-status
-request to each of these in turn. It stores the one that answers, together
+request to each writable characteristic of the service, these first. It stores the one that answers, together
 with the characteristic the reply arrived on, so no configuration is needed
 and later connections subscribe only where replies arrive. If the device
 doesn't answer, nothing is stored and you can try again.
 
 To detect both again, for example after a firmware update, use
-**Reconfigure** on the integration entry. Devices added with an older version
+**Reconfigure** on the integration entry. Setup and Reconfigure show each
+step of the detection as it runs. Devices added with an older version
 keep the previous behaviour (`6e400002`) until they are reconfigured.
 
 The detected characteristics and the signal strength of the device's

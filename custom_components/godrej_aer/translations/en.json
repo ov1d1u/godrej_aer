@@ -2,14 +2,14 @@
     "config": {
         "abort": {
             "already_configured": "Device is already configured",
-            "reconfigure_successful": "Reconfiguration was successful"
+            "channels_detected": "Detected command channel {command} and reply channel {reply}."
         },
         "error": {
             "cannot_connect": "Failed to connect",
             "invalid_mac": "Invalid MAC address",
             "invalid_device": "This is not a supported Smart Matic device",
             "unknown": "Unexpected error",
-            "no_reply": "The device was found but did not answer a status request on any known command channel. Move it closer to a Bluetooth adapter or proxy, make sure no other app is connected to it, and try again."
+            "no_reply": "The device didn't respond. Move it closer to a Bluetooth adapter or proxy, close the Godrej app, and try again."
         },
         "step": {
             "user": {
@@ -28,12 +28,18 @@
                 "title": "Name Device",
                 "data": {
                     "name": "Name"
-                }
+                },
+                "description": "Detected command channel {command} and reply channel {reply}."
             },
             "reconfigure": {
-                "title": "Detect channels again",
-                "description": "Currently saved: command channel {command}, replies on {reply}. Submit to connect to the device and detect both again, for example after a firmware update. Nothing is changed unless the device answers."
+                "title": "Detect channels",
+                "description": "Detect the device's command and reply channels again, for example after a firmware update."
             }
+        },
+        "progress": {
+            "connecting": "Connecting to the device…",
+            "probing": "Checking channel {index} of {total} ({channel})…",
+            "probing_again": "Setting the clock and checking channel {index} of {total} ({channel}) again…"
         }
     },
     "services": {

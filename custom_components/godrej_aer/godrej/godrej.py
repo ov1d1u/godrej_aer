@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from bleak import BleakClient
 from bleak_retry_connector import establish_connection
@@ -461,13 +462,19 @@ class SmartMatic:
         return True
 
     async def detect_channels(
-        self, *, timeout: float = STATUS_TIMEOUT
+        self,
+        *,
+        timeout: float = STATUS_TIMEOUT,
+        progress: Callable[[str, dict, float], None] | None = None,
     ) -> tuple[str, str] | None:
         """Find the command and reply characteristics on a fresh link.
 
         Returns None if the device is reachable but never answers. The
-        channels this instance uses are left unchanged.
+        channels this instance uses are left unchanged. ``progress`` is
+        called with (stage, details, fraction done) as detection proceeds.
         """
+        report = progress or (lambda stage, details, fraction: None)
+        report("connecting", {}, 0.0)
         async with self._connect_lock:
             saved = self._command_char, self._reply_char
             # Start clean so every notify characteristic gets subscribed.
@@ -476,7 +483,9 @@ class SmartMatic:
             try:
                 await self._open_connection()
                 try:
-                    command = await self._detect_command_char(timeout=timeout)
+                    command = await self._detect_command_char(
+                        timeout=timeout, progress=report
+                    )
                 except ConnectionError as e:
                     _LOGGER.warning("Could not detect the command channel: %s", e)
                     return None
@@ -614,6 +623,7 @@ class SmartMatic:
         *,
         timeout: float = STATUS_TIMEOUT,
         set_time_passes: tuple[bool, ...] = (False, True),
+        progress: Callable[[str, dict, float], None] = lambda *_: None,
     ):
         """Send fetch-status to each candidate; keep the one that answers.
 
@@ -624,11 +634,19 @@ class SmartMatic:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
 
+        attempts = len(candidates) * len(set_time_passes)
+        attempt = 0
         for set_time_first in set_time_passes:
-            for char in candidates:
+            for index, char in enumerate(candidates, start=1):
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     break
+                progress(
+                    "probing_again" if set_time_first else "probing",
+                    {"index": str(index), "total": str(len(candidates)), "channel": char[:8]},
+                    attempt / attempts,
+                )
+                attempt += 1
                 _LOGGER.debug(
                     "Probing %s as command channel for %s%s...",
                     char, self.mac, " (after set time)" if set_time_first else ""
