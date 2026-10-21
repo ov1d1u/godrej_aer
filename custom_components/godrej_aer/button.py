@@ -4,7 +4,7 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.core import HomeAssistant
-from homeassistant.const import CONF_NAME
+from homeassistant.const import CONF_NAME, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .entity import async_device_device_info_fn
@@ -57,6 +57,8 @@ class SmartMaticResetRefillButton(SmartMaticButton):
     _key = "reset_refill"
     _name_suffix = "Reset Refill Level"
     _attr_icon = "mdi:cup-water"
+    # Its own card on the device page, away from the everyday controls.
+    _attr_entity_category = EntityCategory.CONFIG
 
     async def async_press(self) -> None:
         await self._instance.reset_refill()
