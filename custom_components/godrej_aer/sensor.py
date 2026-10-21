@@ -29,16 +29,17 @@ from .godrej.events import DEVICE_STATUS_UPDATE
 async def async_setup_entry(hass, config_entry, async_add_entities):
     instance: SmartMatic = config_entry.runtime_data
     async_add_entities([
+        SmartMaticBatterySensor(instance, config_entry),
         SmartMaticBatteryVoltageSensor(instance, config_entry),
         SmartMaticRefillLevelSensor(instance, config_entry),
         SmartMaticSprayCountSensor(instance, config_entry),
         SmartMaticChannelSensor(
             instance, config_entry, "command_channel",
-            "Command channel", instance.command_char,
+            "Channel: command", instance.command_char,
         ),
         SmartMaticChannelSensor(
             instance, config_entry, "reply_channel",
-            "Reply channel", instance.reply_char,
+            "Channel: reply", instance.reply_char,
         ),
         SmartMaticSignalStrengthSensor(instance, config_entry),
     ])
@@ -49,6 +50,7 @@ class SmartMaticSensor(SensorEntity):
 
     _key: str
     _value_fn: Callable[[DeviceStatus], float | int | None]
+    _attr_has_entity_name = True
 
     def __init__(self, instance: SmartMatic, config_entry: ConfigEntry):
         self._instance = instance
@@ -78,18 +80,35 @@ class SmartMaticSensor(SensorEntity):
         self.async_write_ha_state()
 
 
-class SmartMaticBatteryVoltageSensor(SmartMaticSensor):
-    _key = "battery_voltage"
-    _attr_name = "SmartMatic Battery Voltage"
-    _attr_native_unit_of_measurement = UnitOfElectricPotential.MILLIVOLT
+class SmartMaticBatterySensor(SmartMaticSensor):
+    """Estimated battery level (linear in the voltage; see const.py)."""
+
+    _key = "battery_level"
+    _attr_name = "Battery"
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_native_unit_of_measurement = PERCENTAGE
     _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_icon = "mdi:battery"
+    _value_fn = staticmethod(lambda status: status.battery_percent)
+
+
+class SmartMaticBatteryVoltageSensor(SmartMaticSensor):
+    """The measured voltage the battery level is estimated from."""
+
+    _key = "battery_voltage"
+    _attr_name = "Battery voltage"
+    _attr_device_class = SensorDeviceClass.VOLTAGE
+    _attr_native_unit_of_measurement = UnitOfElectricPotential.MILLIVOLT
+    _attr_suggested_display_precision = 0
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    # The Battery sensor shows the level; enable this for the raw voltage.
+    _attr_entity_registry_enabled_default = False
     _value_fn = staticmethod(lambda status: status.battery_mv)
 
 
 class SmartMaticRefillLevelSensor(SmartMaticSensor):
     _key = "refill_level"
-    _attr_name = "SmartMatic Refill Level"
+    _attr_name = "Refill level"
     _attr_native_unit_of_measurement = PERCENTAGE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:cup-water"
@@ -98,7 +117,7 @@ class SmartMaticRefillLevelSensor(SmartMaticSensor):
 
 class SmartMaticSprayCountSensor(SmartMaticSensor):
     _key = "spray_count"
-    _attr_name = "SmartMatic Spray Count"
+    _attr_name = "Spray count"
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_icon = "mdi:counter"
     _value_fn = staticmethod(lambda status: status.total_spray_count)
@@ -111,6 +130,8 @@ class SmartMaticChannelSensor(SensorEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_icon = "mdi:bluetooth-settings"
     _attr_should_poll = False
+    # Only needed for troubleshooting: enable it on the device page.
+    _attr_entity_registry_enabled_default = False
 
     def __init__(self, instance, config_entry, key, name, uuid):
         self._instance = instance

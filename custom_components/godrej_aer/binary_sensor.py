@@ -54,7 +54,7 @@ class SmartMaticReachableBinarySensor(SmartMaticBinarySensor):
     """
 
     _events = (DEVICE_REACHABILITY, DEVICE_STATUS_UPDATE)
-    _attr_name = "Status"
+    _attr_name = "Connection status"
     _attr_translation_key = "status"
 
     def __init__(self, instance: SmartMatic, config_entry: ConfigEntry):
@@ -85,7 +85,7 @@ class SmartMaticBluetoothLinkBinarySensor(SmartMaticBinarySensor):
     """
 
     _events = (DEVICE_CONNECT, DEVICE_DISCONNECT)
-    _attr_name = "Bluetooth link"
+    _attr_name = "Connection link"
     _attr_translation_key = "bluetooth_link"
     _attr_entity_registry_enabled_default = False
 

@@ -10,7 +10,7 @@ This integration currently supports the following features:
 - Turn auto-spray on/off via a `switch` entity
 - Choose the auto-spray interval (10 / 20 / 40 minutes) via a `select` entity
 - Reset the refill level via a `button` entity (after replacing the cartridge)
-- Battery level monitoring (in mV)
+- Battery level as a percentage of what the device can use: the alkaline discharge curve, from 3.1 V (100 %) down to the device's 2.4 V cut-off (0 %); the measured voltage is a diagnostic sensor. Below 2.4 V the device still acknowledges sprays without spraying, so Spray now and Spray: auto show "Batteries are too low to spray"
 - Estimated refill level (%) and lifetime spray count sensors
 - Connection state via a `binary_sensor` entity
 - On-demand status refresh via the `godrej_aer.update_status` service
@@ -62,30 +62,32 @@ To configure the Godrej Aer Smart Matic integration:
    
 2. **Manual MAC Address Entry**: If your device is not automatically discovered, you can manually enter the MAC address.
 
-## Firmware variants
+## Command and reply channels
 
-Different firmware builds accept commands on different characteristics of
-the `6e400000-…` service, while replies always come back as notifications
-on `6e400001-…`:
+The device takes commands on a characteristic of the `6e400000-…` service
+and replies with notifications on `6e400001-…`. Firmware 3.0.8-IN accepts
+commands on `6e400002-…`, `6e400003-…` and `6e400004-…` alike; other builds
+have been reported to use `6e400003-…` only.
 
-| Firmware | Command characteristic |
-|----------|------------------------|
-| original target of this integration | `6e400002-…` |
-| 3.0.6-T1 | `6e400003-…` |
-| 3.0.8-IN | `6e400004-…` |
+When you add a device, the integration checks the defaults (commands on
+`6e400002-…`, replies on `6e400001-…`) with the read-only fetch-status
+request. If they don't answer, it probes every writable characteristic of
+the service, with every notifying one subscribed, and stores whichever pair
+answers. If nothing answers, nothing is stored and you can try again.
 
-When you add a device, the integration sends the (read-only) fetch-status
-request to each writable characteristic of the service, these first. It stores the one that answers, together
-with the characteristic the reply arrived on, so no configuration is needed
-and later connections subscribe only where replies arrive. If the device
-doesn't answer, nothing is stored and you can try again.
+To check again, for example after a firmware update, use **Reconfigure** on
+the integration entry. Setup and Reconfigure show each step as it runs.
+Devices added with an older version use the defaults until reconfigured.
 
-To detect both again, for example after a firmware update, use
-**Reconfigure** on the integration entry. Setup and Reconfigure show each
-step of the detection as it runs. Devices added with an older version
-keep the previous behaviour (`6e400002`) until they are reconfigured.
+## Command confirmation
 
-The detected characteristics and the signal strength of the device's
+Every command (Spray now, Spray: auto, Spray: interval, Reset refill level) waits
+up to 3 seconds for the device's acknowledgement. Without one, Home
+Assistant shows an error, the Spray: auto toggle and Spray: interval keep
+their previous state, and the status is read back so the entities show
+what the device is actually doing.
+
+The channels in use and the battery voltage (both disabled by default) and the signal strength of the device's
 advertisements (with the adapter or proxy that received them) are shown as
 diagnostic sensors on the device page.
 
@@ -99,10 +101,12 @@ firmware string lengths, extra fields) work, as do frames split over several
 notifications.
 
 To save battery, the integration disconnects after each exchange, so the
-link opening and closing is normal. **Status** shows whether the device is
+link opening and closing is normal. **Connection status** shows whether the device is
 actually working: it reads **OK**, and changes to **Unreachable** only if an
-exchange fails or the device stops advertising. Its `last_update` attribute
-shows when the last status arrived. The raw **Bluetooth link** sensor
+exchange fails or the device stops advertising. After a failed attempt the
+integration retries after 30 s, then 1, 2 and 5 minutes, and every 5 minutes
+from then on until the device answers. Its `last_update` attribute
+shows when the last status arrived. The raw **Connection link** sensor
 (Active/Idle) is disabled by default; enable it to debug connections.
 
 ## Troubleshooting

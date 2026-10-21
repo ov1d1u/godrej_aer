@@ -8,7 +8,7 @@ from homeassistant.const import Platform, CONF_MAC
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 
 from .const import CONF_COMMAND_CHAR, CONF_REPLY_CHAR
 from .godrej import SmartMatic
@@ -41,12 +41,36 @@ async def async_setup_entry(
 
     async_setup_services(hass)
 
+    retry_timer = None
+
+    @callback
+    def _cancel_retry_timer():
+        nonlocal retry_timer
+        if retry_timer is not None:
+            retry_timer()
+            retry_timer = None
+
+    entry.async_on_unload(_cancel_retry_timer)
+
     async def _connect_if_needed():
+        nonlocal retry_timer
         if bluetooth.async_address_present(hass, mac, connectable=True):
             try:
                 await instance.connect_if_needed()
             except Exception:
                 _LOGGER.debug("Background connect attempt failed for %s", mac, exc_info=True)
+                # Retry exactly when the backoff ends, not at the next
+                # periodic tick (up to a minute later).
+                delay = instance.retry_delay
+                if delay is not None:
+                    _cancel_retry_timer()
+                    retry_timer = async_call_later(hass, delay + 0.5, _retry_now)
+
+    @callback
+    def _retry_now(_now) -> None:
+        nonlocal retry_timer
+        retry_timer = None
+        _schedule_connect()
 
     @callback
     def _schedule_connect():

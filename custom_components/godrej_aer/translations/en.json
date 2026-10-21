@@ -38,6 +38,7 @@
         },
         "progress": {
             "connecting": "Connecting to the device…",
+            "checking_defaults": "Checking the default channels…",
             "probing": "Checking channel {index} of {total} ({channel})…",
             "probing_again": "Setting the clock and checking channel {index} of {total} ({channel}) again…"
         }
@@ -62,6 +63,17 @@
                     "off": "Unreachable"
                 }
             }
+        }
+    },
+    "exceptions": {
+        "command_not_confirmed": {
+            "message": "The air freshener didn't confirm the command. Check that it's in range and try again."
+        },
+        "cannot_reach": {
+            "message": "Couldn't reach the air freshener. Check that it's switched on and in range, and try again."
+        },
+        "battery_too_low": {
+            "message": "Batteries are too low to spray. Replace them."
         }
     }
 }

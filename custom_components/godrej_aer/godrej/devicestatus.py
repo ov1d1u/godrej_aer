@@ -3,7 +3,7 @@ import struct
 from datetime import datetime, timedelta
 
 from . import cbor
-from .const import SPRAY_CAPACITY
+from .const import BATTERY_CURVE, SPRAY_CAPACITY
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,8 +82,7 @@ class DeviceStatus:
         self.acknowledgement = message.get("ack")
 
         if self.message_type != STATUS_REPLY_MT:
-            _LOGGER.debug("Not a status reply (mT=%s)", self.message_type)
-            return
+            return  # e.g. a command acknowledgement
         if self.acknowledgement is not None and self.acknowledgement != ACK_OK:
             _LOGGER.debug("Status reply not acknowledged (ack=%s)", self.acknowledgement)
             return
@@ -153,6 +152,19 @@ class DeviceStatus:
         if self.battery_mv is None:
             return None
         return round(self.battery_mv / 1000, 3)
+
+    @property
+    def battery_percent(self) -> int | None:
+        """Estimated battery level, 0-100, from the voltage (BATTERY_CURVE)."""
+        mv = self.battery_mv
+        if mv is None:
+            return None
+        if mv >= BATTERY_CURVE[0][0]:
+            return BATTERY_CURVE[0][1]
+        for (hi_mv, hi_pct), (lo_mv, lo_pct) in zip(BATTERY_CURVE, BATTERY_CURVE[1:]):
+            if mv >= lo_mv:
+                return round(lo_pct + (hi_pct - lo_pct) * (mv - lo_mv) / (hi_mv - lo_mv))
+        return 0
 
     @property
     def spray_interval(self) -> int:
