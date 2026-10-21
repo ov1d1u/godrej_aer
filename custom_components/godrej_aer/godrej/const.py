@@ -5,17 +5,29 @@
 # carries the status notification (and whether it exposes a CCC descriptor),
 # so the code subscribes to *every* notify characteristic in MAIN_SVC and
 # tries NOTIFY_CHAR first. See SmartMatic._subscribe_notifications.
+# Replies arrive on NOTIFY_CHAR (no CCCD) on all firmware seen so far.
 MAIN_SVC = "6e400000-b5a3-f393-e0a9-e50e24dcca9e"
 NOTIFY_CHAR = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-WRITE_CHAR = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+
+# Command characteristic per firmware: 6e400002 (original),
+# 6e400003 (3.0.6-T1), 6e400004 (3.0.8-IN). Probed in this order.
+COMMAND_CHAR_CANDIDATES = (
+    "6e400002-b5a3-f393-e0a9-e50e24dcca9e",
+    "6e400003-b5a3-f393-e0a9-e50e24dcca9e",
+    "6e400004-b5a3-f393-e0a9-e50e24dcca9e",
+)
+# Used while no channel is known (the historical default).
+WRITE_CHAR = COMMAND_CHAR_CANDIDATES[0]
 
 # Seconds to stay connected after a successful exchange before dropping the
 # link (keeping it open drains the device battery).
 DISCONNECT_DELAY = 15
-# Seconds to wait for the 99-byte status notification after asking for it.
+# Seconds to wait for the status notification after asking for it.
 STATUS_TIMEOUT = 30
+# Seconds to wait for a reply from each candidate while probing.
+PROBE_TIMEOUT = 5
 # Seconds to back off polling after a failed connect attempt.
-CONNECT_RETRY_COOLDOWN = 1800
+CONNECT_RETRY_COOLDOWN = 300
 
 # Auto-spray intervals the device (and the official app) support, in minutes.
 SPRAY_INTERVALS = (10, 20, 40)
@@ -26,6 +38,6 @@ DEFAULT_SPRAY_INTERVAL = 10
 SPRAY_CAPACITY = 2200
 
 # ATT MTU to request after connecting, matching the official app. The
-# 99-byte status frame needs an MTU of at least ~102 to arrive in a single
-# notification; the default of 23 would truncate it.
+# status frame (99-105 bytes) needs an MTU of ~108 to fit one notification;
+# otherwise SmartMatic reassembles the fragments.
 DESIRED_MTU = 185

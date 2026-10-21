@@ -7,14 +7,20 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_MAC, CONF_NAME
+from homeassistant.core import callback
 from homeassistant.helpers.device_registry import format_mac
 from homeassistant.components.bluetooth import (
     async_discovered_service_info
 )
 
-from .const import DOMAIN
+from .const import CHANNEL_CHOICES, CHANNEL_DETECT, CONF_COMMAND_CHAR, DOMAIN
 from .godrej import SmartMatic
 from .godrej.exception import InvalidDeviceError, ConnectionError
 
@@ -29,20 +35,20 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self):
         self.name = "Godrej Aer Smart Matic"
         self.mac = None
+        self.command_char = None
         self._manual_entry = False
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        return GodrejAerOptionsFlow(config_entry)
 
     def _is_device_supported(self, device_info):
         name = device_info.name or ""
         return "smart matic" in name.lower()
 
-    async def _validate_device(self, smartmatic):
-        # Getting the BLE link up and confirming the device looks right is
-        # enough to add it. The status read may not work over every transport
-        # (an ESPHome Bluetooth proxy cannot enable notifications on this
-        # device's status characteristic, which has no CCC descriptor), so a
-        # status timeout here must not block setup - keep the wait short.
-        if not await smartmatic.connect(require_status=False, status_timeout=10):
-            raise ConnectionError("Unable to connect")
+    async def _validate_device(self, smartmatic) -> str | None:
+        return await smartmatic.detect_command_channel()
 
     async def async_step_user(
         self,
@@ -127,7 +133,7 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
         error = None
         smartmatic = SmartMatic(self.hass, self.mac)
         try:
-            await self._validate_device(smartmatic)
+            self.command_char = await self._validate_device(smartmatic)
         except InvalidDeviceError:
             error = "invalid_device"
         except ConnectionError:
@@ -143,7 +149,28 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
                 return await self.async_step_manual_mac(errors={"base": error})
             return await self.async_step_user(errors={"base": error})
 
+        if self.command_char is None:
+            return await self.async_step_command_channel()
         return await self.async_step_name()
+
+    async def async_step_command_channel(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Reachable but no reply: let the user choose."""
+        if user_input is not None:
+            choice = user_input[CONF_COMMAND_CHAR]
+            self.command_char = None if choice == CHANNEL_DETECT else choice
+            return await self.async_step_name()
+
+        return self.async_show_form(
+            step_id="command_channel",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_COMMAND_CHAR, default=CHANNEL_DETECT):
+                        vol.In(CHANNEL_CHOICES)
+                }
+            ),
+        )
 
     async def async_step_name(
         self, user_input: dict[str, Any] | None = None
@@ -156,7 +183,8 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
                 title=self.name,
                 data = {
                     CONF_MAC: self.mac,
-                    CONF_NAME: self.name
+                    CONF_NAME: self.name,
+                    CONF_COMMAND_CHAR: self.command_char,
                 }
             )
 
@@ -168,4 +196,40 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
                 }
             ),
             errors={},
+        )
+
+class GodrejAerOptionsFlow(OptionsFlow):
+    """View, override or re-detect the stored command channel."""
+
+    def __init__(self, config_entry: ConfigEntry) -> None:
+        self._entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            choice = user_input[CONF_COMMAND_CHAR]
+            command_char = None if choice == CHANNEL_DETECT else choice
+            if command_char != self._entry.data.get(CONF_COMMAND_CHAR):
+                self.hass.config_entries.async_update_entry(
+                    self._entry,
+                    data={**self._entry.data, CONF_COMMAND_CHAR: command_char},
+                )
+                self.hass.config_entries.async_schedule_reload(self._entry.entry_id)
+            return self.async_create_entry(data=dict(self._entry.options))
+
+        current = self._entry.data.get(CONF_COMMAND_CHAR)
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_COMMAND_CHAR,
+                        default=current if current in CHANNEL_CHOICES else CHANNEL_DETECT,
+                    ): vol.In(CHANNEL_CHOICES)
+                }
+            ),
+            description_placeholders={
+                "current": current[:8] if current else "not detected yet"
+            },
         )

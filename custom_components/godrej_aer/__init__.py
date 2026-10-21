@@ -10,6 +10,7 @@ from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
 from homeassistant.helpers.event import async_track_time_interval
 
+from .const import CONF_COMMAND_CHAR
 from .godrej import SmartMatic
 from .services import async_setup_services, async_unload_services
 
@@ -30,7 +31,18 @@ async def async_setup_entry(
 
     mac = entry.options.get(CONF_MAC, None) or entry.data.get(CONF_MAC, None)
 
-    instance = SmartMatic(hass, mac)
+    @callback
+    def _store_command_char(command_char: str) -> None:
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_COMMAND_CHAR: command_char}
+        )
+
+    instance = SmartMatic(
+        hass,
+        mac,
+        command_char=entry.data.get(CONF_COMMAND_CHAR),
+        on_command_char_detected=_store_command_char,
+    )
     entry.runtime_data = instance
 
     async_setup_services(hass)
@@ -43,13 +55,20 @@ async def async_setup_entry(
                 _LOGGER.debug("Background connect attempt failed for %s", mac, exc_info=True)
 
     @callback
+    def _schedule_connect():
+        # Don't delay startup; cancelled on unload.
+        entry.async_create_background_task(
+            hass, _connect_if_needed(), f"godrej_aer connect {mac}"
+        )
+
+    @callback
     def _async_discovered_device(
         service_info: bluetooth.BluetoothServiceInfoBleak,
         change: bluetooth.BluetoothChange
     ):
         """Subscribe to bluetooth changes."""
         _LOGGER.debug("New service_info: %s", service_info)
-        hass.async_create_task(_connect_if_needed())
+        _schedule_connect()
 
     entry.async_on_unload(
         bluetooth.async_register_callback(
@@ -65,13 +84,13 @@ async def async_setup_entry(
 
     @callback
     def _async_periodic_connect(_now):
-        hass.async_create_task(_connect_if_needed())
+        _schedule_connect()
 
     entry.async_on_unload(
         async_track_time_interval(hass, _async_periodic_connect, timedelta(seconds=60))
     )
 
-    await _connect_if_needed()
+    _schedule_connect()
 
     return True
 

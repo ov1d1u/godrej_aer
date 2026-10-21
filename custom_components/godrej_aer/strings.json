@@ -18,6 +18,13 @@
         "data": {
           "name": "Name"
         }
+      },
+      "command_channel": {
+        "title": "Command channel",
+        "description": "The device was found, but it did not answer a status request on any known command channel, so the channel could not be detected. This can happen when the device is out of range of a Bluetooth adapter or proxy that can deliver its replies. Pick the channel for your firmware if you know it, or leave it to be detected on the next connection.",
+        "data": {
+          "command_char": "Command channel"
+        }
       }
     },
     "error": {
@@ -34,6 +41,17 @@
     "update_status": {
       "name": "Update status",
       "description": "Connects to the Godrej Aer Smart Matic device and refreshes its status. Bypasses the automatic retry cooldown. If no target is given, every configured device is updated."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Command channel",
+        "description": "Current command channel: {current}. Choose \"Detect automatically\" to detect it again on the next connection, for example after a firmware update.",
+        "data": {
+          "command_char": "Command channel"
+        }
+      }
     }
   }
 }

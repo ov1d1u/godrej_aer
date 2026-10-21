@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from bleak import BleakClient
 from bleak_retry_connector import establish_connection
@@ -9,19 +11,22 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.util import dt as dt_util
 
+from . import cbor
 from .const import (
     DISCONNECT_DELAY,
     STATUS_TIMEOUT,
+    PROBE_TIMEOUT,
     CONNECT_RETRY_COOLDOWN,
     MAIN_SVC,
     NOTIFY_CHAR,
     WRITE_CHAR,
+    COMMAND_CHAR_CANDIDATES,
     SPRAY_INTERVALS,
     DEFAULT_SPRAY_INTERVAL,
     DESIRED_MTU,
 )
 from .eventbus import EventBus
-from .devicestatus import DeviceStatus, STATUS_LEN
+from .devicestatus import DeviceStatus
 from .exception import (
     InvalidDeviceError,
     ConnectionError
@@ -33,6 +38,10 @@ from .events import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Limits for reassembling frames split over several notifications.
+_MAX_FRAME_LEN = 512
+_FRAGMENT_TIMEOUT = 2.0
 
 
 def _cbor_uint(n: int) -> bytes:
@@ -133,7 +142,16 @@ def encode_set_time(now: datetime | None = None) -> bytes:
 
 
 class SmartMatic:
-    def __init__(self, hass, mac):
+    def __init__(
+        self,
+        hass,
+        mac,
+        *,
+        command_char: str | None = None,
+        on_command_char_detected: Callable[[str], None] | None = None,
+    ):
+        """If ``command_char`` is None it is detected on the next status
+        read and passed to ``on_command_char_detected``."""
         self.hass = hass
         self.mac = mac
         self.client: BleakClient | None = None
@@ -145,41 +163,33 @@ class SmartMatic:
         self._disconnect_task: asyncio.Task | None = None
         self._retry_after: datetime | None = None
 
-    async def connect(
-        self,
-        *,
-        require_status: bool = True,
-        status_timeout: float = STATUS_TIMEOUT,
-    ) -> bool:
-        """Open the BLE link and fetch a fresh device status.
+        self._command_char: str | None = command_char
+        self._on_command_char_detected = on_command_char_detected
+        self._failure_logged = False
+        # uuid -> (partial frame, time of last fragment)
+        self._rx_buffers: dict[str, tuple[bytearray, float]] = {}
 
-        Used by the polling path. A status timeout here is treated as a
-        connect failure. For just actuating the device (button press) use
-        trigger(), which does not depend on the status read.
+    @property
+    def command_char(self) -> str | None:
+        return self._command_char
 
-        With ``require_status=False`` (used by the config flow) a failure to
-        read the status back is logged but not raised: getting the BLE link
-        up and confirming the device looks right is enough. ``status_timeout``
-        caps how long to wait for that status frame.
-        """
+    @property
+    def _write_char(self) -> str:
+        return self._command_char or WRITE_CHAR
+
+    async def connect(self, *, status_timeout: float = STATUS_TIMEOUT) -> bool:
+        """Open the BLE link and fetch a fresh device status."""
         async with self._connect_lock:
             await self._open_connection()
 
             try:
-                await self._set_time()
+                # Detection sets the time itself once it finds the channel.
+                if self._command_char is not None:
+                    await self._set_time()
                 await self.get_device_status(timeout=status_timeout)
-            except (asyncio.CancelledError, InvalidDeviceError):
+            except BaseException:
                 await self._cleanup_connection()
                 raise
-            except BaseException as e:
-                if require_status:
-                    await self._cleanup_connection()
-                    raise
-                _LOGGER.warning(
-                    "Connected to %s but could not read device status: %s",
-                    self.mac, e
-                )
-                await self.delayed_disconnect()
 
         return True
 
@@ -280,6 +290,7 @@ class SmartMatic:
         # Try the conventional Nordic UART TX characteristic first.
         notify_chars.sort(key=lambda c: c.uuid.lower() != NOTIFY_CHAR.lower())
 
+        self._rx_buffers.clear()
         subscribed = 0
         for char in notify_chars:
             try:
@@ -291,6 +302,8 @@ class SmartMatic:
                     "Failed start_notify on %s for %s: %s",
                     char.uuid, self.mac, e
                 )
+                if await self._raw_proxy_notify(client, char):
+                    subscribed += 1
 
         if subscribed:
             _LOGGER.debug(
@@ -303,6 +316,46 @@ class SmartMatic:
                 "device status updates will not be received",
                 self.mac
             )
+
+    async def _raw_proxy_notify(self, client, char) -> bool:
+        """Subscribe via an ESPHome proxy without writing a CCCD.
+
+        bleak-esphome's start_notify fails on characteristics without a
+        CCCD (6e400001). Registering in ``_notify_cancels`` lets it clean
+        up on disconnect. Uses bleak-esphome internals; returns False if
+        they don't match.
+        """
+        backend = getattr(client, "_backend", None)
+        api = getattr(backend, "_client", None)
+        address = getattr(backend, "_address_as_int", None)
+        cancels = getattr(backend, "_notify_cancels", None)
+        if (
+            api is None
+            or address is None
+            or not isinstance(cancels, dict)
+            or not hasattr(api, "bluetooth_gatt_start_notify")
+        ):
+            _LOGGER.debug(
+                "No ESPHome proxy backend for %s (%s), cannot raw-subscribe %s",
+                self.mac, type(backend).__name__, char.uuid
+            )
+            return False
+        if char.handle in cancels:
+            return True
+
+        uuid = char.uuid
+        try:
+            cancels[char.handle] = await api.bluetooth_gatt_start_notify(
+                address,
+                char.handle,
+                lambda _handle, data: self._on_notification(uuid, data),
+            )
+        except Exception as e:
+            _LOGGER.debug("Raw proxy notify on %s for %s failed: %s", uuid, self.mac, e)
+            return False
+
+        _LOGGER.debug("Raw proxy notify registered on %s for %s", uuid, self.mac)
+        return True
 
     async def _request_mtu(self):
         """Negotiate a larger ATT MTU, mirroring the official app.
@@ -359,17 +412,43 @@ class SmartMatic:
 
         try:
             await self.connect()
-        except Exception:
+        except Exception as e:
             self._retry_after = datetime.now() + timedelta(
                 seconds=CONNECT_RETRY_COOLDOWN
             )
-            _LOGGER.debug(
-                "Connect to %s failed, next attempt no sooner than %s",
-                self.mac, self._retry_after
+            # Warn only on the first failure in a row.
+            log = _LOGGER.debug if self._failure_logged else _LOGGER.warning
+            log(
+                "Could not get status from %s (%s); retrying no sooner than %s",
+                self.mac, e, self._retry_after.strftime("%H:%M:%S")
             )
+            self._failure_logged = True
             raise
 
+        if self._failure_logged:
+            _LOGGER.info("Status from %s is available again", self.mac)
+            self._failure_logged = False
         return True
+
+    async def detect_command_channel(
+        self, *, timeout: float = STATUS_TIMEOUT
+    ) -> str | None:
+        """Connect, detect the command channel, and disconnect.
+
+        Returns None if the device is reachable but never answers.
+        """
+        async with self._connect_lock:
+            try:
+                await self._open_connection()
+                self._command_char = None
+                try:
+                    await self._detect_command_char(timeout=timeout)
+                except ConnectionError as e:
+                    _LOGGER.warning("Could not detect the command channel: %s", e)
+                    return None
+                return self._command_char
+            finally:
+                await self._cleanup_connection()
 
     async def disconnect(self):
         if self.client and self.client.is_connected:
@@ -421,7 +500,7 @@ class SmartMatic:
             self._disconnect_task.cancel()
         self._disconnect_task = loop.create_task(_delayed_disconnect())
 
-    async def _set_time(self):
+    async def _set_time(self, char: str | None = None):
         """Push the current time to the device before reading status.
 
         The official app sends this on every connect. Some devices (in
@@ -436,9 +515,10 @@ class SmartMatic:
             _LOGGER.warning("Could not build set-time message for %s: %s", self.mac, e)
             return
 
-        _LOGGER.debug(">> %s: %s (set time)", WRITE_CHAR, payload.hex())
+        char = char or self._write_char
+        _LOGGER.debug(">> %s: %s (set time)", char, payload.hex())
         try:
-            await self.client.write_gatt_char(WRITE_CHAR, payload)
+            await self.client.write_gatt_char(char, payload)
         except Exception as e:
             _LOGGER.debug("Failed to set time on %s: %s", self.mac, e)
             return
@@ -449,33 +529,99 @@ class SmartMatic:
     async def get_device_status(self, *, timeout: float = STATUS_TIMEOUT):
         _LOGGER.debug("Getting device status from %s...", self.mac)
 
-        # Reset the event before waiting for new status
-        self._device_status_event.clear()
-
-        _LOGGER.debug("Writing to %s on %s...", WRITE_CHAR, self.mac)
-        await self.client.write_gatt_char(WRITE_CHAR, FETCH_STATUS_MSG)
-
-        try:
-            _LOGGER.debug("Waiting for device status from %s...", self.mac)
-
-            await asyncio.wait_for(
-                self._device_status_event.wait(),
-                timeout
-            )
-        except asyncio.TimeoutError as exc:
-            _LOGGER.warning(
-                "Timeout waiting for device status from %s after %ss",
-                self.mac,
-                timeout
-            )
+        if self._command_char is None:
+            await self._detect_command_char(timeout=timeout)
+        elif not await self._request_status(self._command_char, timeout):
+            # Keep the channel: a weak link is likelier than new firmware.
             raise ConnectionError(
                 f"Timeout waiting for device status response from {self.mac}"
-            ) from exc
+            )
 
         # Got a fresh status, clear any retry cooldown from earlier failures.
         self._retry_after = None
 
         await self.delayed_disconnect()
+
+    async def _request_status(self, char: str, timeout: float) -> bool:
+        """Send fetch-status to ``char``; True if a status reply arrived."""
+        self._device_status_event.clear()
+
+        _LOGGER.debug(">> %s: %s (fetch status)", char, FETCH_STATUS_MSG.hex())
+        try:
+            await self.client.write_gatt_char(char, FETCH_STATUS_MSG)
+        except Exception as e:
+            _LOGGER.debug("Write to %s on %s failed: %s", char, self.mac, e)
+            return False
+
+        _LOGGER.debug("Waiting for device status from %s...", self.mac)
+        try:
+            await asyncio.wait_for(self._device_status_event.wait(), timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    def _command_char_candidates(self) -> list[str]:
+        main_svc = self.client.services.get_service(MAIN_SVC) if self.client else None
+        if main_svc is None:
+            return list(COMMAND_CHAR_CANDIDATES)
+
+        candidates = []
+        for uuid in COMMAND_CHAR_CANDIDATES:
+            char = main_svc.get_characteristic(uuid)
+            if char is not None and (
+                "write" in char.properties
+                or "write-without-response" in char.properties
+            ):
+                candidates.append(uuid)
+        return candidates
+
+    async def _detect_command_char(
+        self,
+        *,
+        timeout: float = STATUS_TIMEOUT,
+        set_time_passes: tuple[bool, ...] = (False, True),
+    ):
+        """Send fetch-status to each candidate; keep the one that answers.
+
+        A second pass sets the clock first, for units that stay silent
+        until it is set.
+        """
+        candidates = self._command_char_candidates()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+
+        for set_time_first in set_time_passes:
+            for char in candidates:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                _LOGGER.debug(
+                    "Probing %s as command channel for %s%s...",
+                    char, self.mac, " (after set time)" if set_time_first else ""
+                )
+                if set_time_first:
+                    await self._set_time(char)
+                if await self._request_status(char, min(PROBE_TIMEOUT, remaining)):
+                    self._command_char = char
+                    _LOGGER.info(
+                        "Using %s as command channel for %s (firmware %s)",
+                        char, self.mac,
+                        self.device_status.firmware_version if self.device_status else "?"
+                    )
+                    if self._on_command_char_detected is not None:
+                        try:
+                            self._on_command_char_detected(char)
+                        except Exception:
+                            _LOGGER.exception(
+                                "Could not store the command channel for %s", self.mac
+                            )
+                    if not set_time_first:
+                        await self._set_time()
+                    return
+
+        raise ConnectionError(
+            f"No status reply from {self.mac} on any of {', '.join(candidates)}"
+        )
 
     async def _write_action(self, payload: bytes, *, refresh: bool = True):
         """Send a command that changes device state.
@@ -487,11 +633,20 @@ class SmartMatic:
         """
         await self._ensure_connected()
 
-        _LOGGER.debug(">> %s: %s", WRITE_CHAR, payload.hex())
-        await self.client.write_gatt_char(WRITE_CHAR, payload)
+        # Actions never probe.
+        if self._command_char is None:
+            _LOGGER.warning(
+                "Command channel for %s not known yet; sending to %s",
+                self.mac, self._write_char
+            )
+
+        char = self._write_char
+        _LOGGER.debug(">> %s: %s", char, payload.hex())
+        await self.client.write_gatt_char(char, payload)
         _LOGGER.debug("Write complete.")
 
-        if not refresh:
+        # A read-back would run detection inside the button press.
+        if not refresh or self._command_char is None:
             await self.delayed_disconnect()
             return
 
@@ -553,18 +708,40 @@ class SmartMatic:
             await self._open_connection()
 
     async def _notification_handler(self, sender, data):
-        uuid = getattr(sender, "uuid", sender)
-        _LOGGER.debug("<< %s: %s", uuid, data.hex())
+        self._on_notification(getattr(sender, "uuid", str(sender)), data)
 
-        # The status frame is a fixed 99 bytes. We subscribe to every notify
-        # characteristic (see _subscribe_notifications), so match on the
-        # frame shape rather than the source characteristic.
-        if len(data) != STATUS_LEN:
+    def _on_notification(self, uuid: str, data: bytes):
+        """Buffer fragments per characteristic until a CBOR item is complete."""
+        _LOGGER.debug("<< %s (%d): %s", uuid, len(data), bytes(data).hex())
+
+        now = time.monotonic()
+        buf, last = self._rx_buffers.get(uuid, (bytearray(), now))
+        if buf and now - last > _FRAGMENT_TIMEOUT:
+            _LOGGER.debug("Dropping stale partial frame on %s: %s", uuid, buf.hex())
+            buf = bytearray()
+        buf.extend(data)
+
+        try:
+            _, end = cbor.decode(bytes(buf))
+        except cbor.CBORIncompleteError:
+            if len(buf) > _MAX_FRAME_LEN:
+                _LOGGER.debug("Dropping oversized partial frame on %s", uuid)
+                self._rx_buffers.pop(uuid, None)
+            else:
+                self._rx_buffers[uuid] = (buf, now)
             return
+        except cbor.CBORError:
+            # Not CBOR; DeviceStatus still tries the legacy layout.
+            end = len(buf)
 
-        status = DeviceStatus(bytes(data))
+        self._rx_buffers.pop(uuid, None)
+        self._handle_message(bytes(buf[:end]))
+
+    def _handle_message(self, frame: bytes):
+        status = DeviceStatus(frame)
         if not status.is_valid:
-            _LOGGER.debug("Ignoring malformed status frame from %s", self.mac)
+            # e.g. command acks
+            _LOGGER.debug("Ignoring non-status message from %s", self.mac)
             return
 
         self.device_status = status

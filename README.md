@@ -62,6 +62,38 @@ To configure the Godrej Aer Smart Matic integration:
    
 2. **Manual MAC Address Entry**: If your device is not automatically discovered, you can manually enter the MAC address.
 
+## Firmware variants
+
+Different firmware builds accept commands on different characteristics of
+the `6e400000-…` service, while replies always come back as notifications
+on `6e400001-…`:
+
+| Firmware | Command characteristic |
+|----------|------------------------|
+| original target of this integration | `6e400002-…` |
+| 3.0.6-T1 | `6e400003-…` |
+| 3.0.8-IN | `6e400004-…` |
+
+When you add a device, the integration sends the (read-only) fetch-status
+request to each of these in turn and stores the one that answers with the
+device, so no configuration is needed and the device is never probed again.
+If the device is reachable but does not answer on any of them, you are asked
+to pick the channel or leave it to be detected on the next connection.
+Devices added with an older version of the integration are detected once,
+on their first connection, and the result is stored the same way.
+
+To see the stored channel, change it, or have it detected again (for example
+after a firmware update), open the integration's **Configure** dialog.
+
+`6e400001-…` has no Client Characteristic Configuration descriptor, which
+the ESPHome Bluetooth proxy normally requires before forwarding
+notifications. When subscribing the normal way fails, the integration asks
+the proxy to forward that characteristic directly.
+
+Status replies are decoded as CBOR by key, so frames of other lengths (other
+firmware string lengths, extra fields) work, as do frames split over several
+notifications.
+
 ## Troubleshooting
 
 - **Device Not Found**: Ensure that your Godrej Aer Smart Matic device is powered on and within Bluetooth range. This devices seems to have bad connectivity range, so make sure that the device is pretty close to a Bluetooth proxy.
