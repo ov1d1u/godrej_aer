@@ -114,6 +114,24 @@ shows when the last status arrived. The raw **Connection link** sensor
 - **Device Not Found**: Ensure that your Godrej Aer Smart Matic device is powered on and within Bluetooth range. This devices seems to have bad connectivity range, so make sure that the device is pretty close to a Bluetooth proxy.
 - **Connection Issues**: If you're using Bluetooth proxies, sometimes it seems that they "hang" on the connection. Restart them and try again.
 
+## Development
+
+The device library has a small test suite that runs without Home Assistant:
+
+```
+pip install pytest pytest-asyncio bleak bleak-retry-connector
+pytest
+```
+
+The config flow, options flow and entry setup are tested against Home
+Assistant itself, in a separate environment (Home Assistant's Bluetooth
+component also needs its own requirements, listed in its `manifest.json`):
+
+```
+pip install pytest-homeassistant-custom-component
+pytest tests_ha
+```
+
 ## License
 
 This project is licensed under the terms of the Apache 2.0 license.
