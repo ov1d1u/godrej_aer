@@ -68,8 +68,3 @@ BATTERY_CURVE = (
 )
 # Sprays a full cartridge is rated for; used to derive a refill percentage.
 SPRAY_CAPACITY = 2200
-
-# ATT MTU to request after connecting, matching the official app. The
-# status frame (99-105 bytes) needs an MTU of ~108 to fit one notification;
-# otherwise SmartMatic reassembles the fragments.
-DESIRED_MTU = 185

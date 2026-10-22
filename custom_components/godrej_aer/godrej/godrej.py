@@ -29,7 +29,6 @@ from .const import (
     COMMAND_CHAR_CANDIDATES,
     SPRAY_INTERVALS,
     DEFAULT_SPRAY_INTERVAL,
-    DESIRED_MTU,
     ACTION_SETTLE,
 )
 from .eventbus import EventBus
@@ -246,6 +245,7 @@ class SmartMatic:
     async def connect(self, *, status_timeout: float = STATUS_TIMEOUT) -> bool:
         """Open the BLE link and fetch a fresh device status."""
         async with self._connect_lock:
+            self._cancel_delayed_disconnect()
             await self._open_connection()
 
             try:
@@ -406,12 +406,15 @@ class SmartMatic:
         """Subscribe to notifications once per connection."""
         async with self._subscribe_lock:
             client = self.client
-            if self._subscribed or client is None:
+            if client is None or not client.is_connected:
+                raise ConnectionError(f"Device {self.mac} is not connected over Bluetooth")
+            if self._subscribed:
                 return
             await self._subscribe_notifications(
                 client, client.services.get_service(MAIN_SVC)
             )
-            await self._request_mtu()
+            if self.client is not client or not client.is_connected:
+                raise ConnectionError(f"Device {self.mac} disconnected during notification setup")
             self._subscribed = True
 
     async def _raw_proxy_notify(self, client, char) -> bool:
@@ -453,41 +456,6 @@ class SmartMatic:
 
         _LOGGER.debug("Raw proxy notify registered on %s for %s", uuid, self.mac)
         return True
-
-    async def _request_mtu(self):
-        """Negotiate a larger ATT MTU, mirroring the official app.
-
-        Best effort only. Which of these works depends on the bleak
-        backend: BlueZ negotiates automatically and exposes only a way to
-        force the exchange early; CoreBluetooth and ESPHome proxies size
-        the MTU themselves. A failure here is harmless, so it is only
-        logged.
-        """
-        client = self.client
-        if client is None:
-            return
-
-        try:
-            request_mtu = getattr(client, "request_mtu", None)
-            if request_mtu is not None:
-                # Not in bleak's public API today, but some wrappers add it.
-                await request_mtu(DESIRED_MTU)
-            else:
-                backend = getattr(client, "_backend", None)
-                # BlueZ: force the MTU exchange that would otherwise be lazy.
-                negotiate = (
-                    getattr(backend, "_acquire_mtu", None)
-                    or getattr(backend, "_negotiate_mtu", None)
-                )
-                if negotiate is not None:
-                    await negotiate()
-        except Exception as e:
-            _LOGGER.debug("MTU negotiation with %s failed: %s", self.mac, e)
-
-        try:
-            _LOGGER.debug("MTU for %s is %s", self.mac, client.mtu_size)
-        except Exception:
-            pass
 
     @property
     def retry_delay(self) -> float | None:
@@ -559,10 +527,8 @@ class SmartMatic:
         """
         report = progress or (lambda stage, details, fraction: None)
         report("connecting", {}, 0.0)
+        self._cancel_refresh()
         async with self._connect_lock:
-            if self._refresh_task is not None:
-                self._refresh_task.cancel()
-                self._refresh_task = None
             saved = self._command_char, self._reply_char
             await self._cleanup_connection()
             self._command_char, self._reply_char = DEFAULT_COMMAND_CHAR, DEFAULT_REPLY_CHAR
@@ -608,10 +574,25 @@ class SmartMatic:
                 self._detecting = self._subscribe_all = False
                 await self._cleanup_connection()
 
+    def _cancel_delayed_disconnect(self):
+        task = self._disconnect_task
+        self._disconnect_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _cancel_refresh(self):
+        task = self._refresh_task
+        self._refresh_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
     async def disconnect(self):
-        if self._refresh_task is not None:
-            self._refresh_task.cancel()
-            self._refresh_task = None
+        async with self._connect_lock:
+            self._cancel_delayed_disconnect()
+            self._cancel_refresh()
+            return await self._disconnect()
+
+    async def _disconnect(self):
         if self.client and self.client.is_connected:
             _LOGGER.debug("Disconnecting from %s...", self.mac)
             await self.client.disconnect()
@@ -628,10 +609,11 @@ class SmartMatic:
         """
         client = self.client
         self.client = None
+        self._subscribed = False
+        if client is not None:
+            self.eventbus.send(DEVICE_DISCONNECT, self)
 
-        if self._disconnect_task is not None:
-            self._disconnect_task.cancel()
-            self._disconnect_task = None
+        self._cancel_delayed_disconnect()
 
         if client is None:
             return
@@ -657,8 +639,7 @@ class SmartMatic:
 
         _LOGGER.debug("Scheduling delayed disconnect from %s...", self.mac)
         loop = asyncio.get_running_loop()
-        if self._disconnect_task is not None:
-            self._disconnect_task.cancel()
+        self._cancel_delayed_disconnect()
         self._disconnect_task = loop.create_task(_delayed_disconnect())
 
     async def _set_time(self, char: str | None = None):
@@ -679,7 +660,7 @@ class SmartMatic:
         char = char or self._write_char
         _LOGGER.debug(">> %s: %s (set time)", char, payload.hex())
         try:
-            await self.client.write_gatt_char(char, payload)
+            await self._write_message(payload, char=char)
         except Exception as e:
             _LOGGER.debug("Failed to set time on %s: %s", self.mac, e)
             return
@@ -709,7 +690,7 @@ class SmartMatic:
 
         _LOGGER.debug(">> %s: %s (fetch status)", char, message.hex())
         try:
-            await self.client.write_gatt_char(char, message)
+            await self._write_message(message, char=char)
         except Exception as e:
             _LOGGER.debug("Write to %s on %s failed: %s", char, self.mac, e)
             return False
@@ -822,12 +803,14 @@ class SmartMatic:
         """
         queued_at = asyncio.get_running_loop().time()
         async with self._command_lock:
-            failed_at = self._connect_failed_at
-            if failed_at is not None and failed_at >= queued_at:
-                raise ConnectionError(
-                    f"{self.mac} could not be reached for an earlier command"
-                )
-            await self._send_command(payload, reply_mt)
+            self._cancel_refresh()
+            async with self._connect_lock:
+                failed_at = self._connect_failed_at
+                if failed_at is not None and failed_at >= queued_at:
+                    raise ConnectionError(
+                        f"{self.mac} could not be reached for an earlier command"
+                    )
+                await self._send_command(payload, reply_mt)
 
     async def _send_command(self, payload: bytes, reply_mt: int):
         try:
@@ -837,11 +820,6 @@ class SmartMatic:
             self._set_exchange_ok(False)
             raise
 
-        # A read-back from an earlier press is superseded by this one's.
-        if self._refresh_task is not None:
-            self._refresh_task.cancel()
-            self._refresh_task = None
-
         label = _ACK_LABELS.get(reply_mt, f"Command {reply_mt - 50}")
         ack = None
         loop = asyncio.get_running_loop()
@@ -850,7 +828,7 @@ class SmartMatic:
         try:
             char = self._write_char
             _LOGGER.debug(">> %s: %s", char, payload.hex())
-            await self.client.write_gatt_char(char, payload)
+            await self._write_message(payload, char=char)
             sent_at = loop.time()
             ack = await asyncio.wait_for(future, ACK_TIMEOUT)
             _LOGGER.debug("%s answered in %.2f s", label, loop.time() - sent_at)
@@ -869,28 +847,40 @@ class SmartMatic:
         if ack != ACK_OK:
             raise CommandNotConfirmed(f"{label} not confirmed by {self.mac} (ack={ack})")
 
+    async def _write_message(self, payload: bytes, *, char: str | None = None):
+        """Use a stable client reference and never retry an action write."""
+        client = self.client
+        if client is None or not client.is_connected:
+            raise ConnectionError(f"Device {self.mac} is not connected over Bluetooth")
+        try:
+            await client.write_gatt_char(char or self._write_char, payload)
+        except Exception as e:
+            raise ConnectionError(
+                f"Failed to send command to device {self.mac}: {e}"
+            ) from e
+
     def _schedule_refresh(self):
         """Read the status back in the background after an action.
 
         The press returns once the command is acknowledged (or not);
         presses in quick succession share one read-back.
         """
-        if self._refresh_task is not None:
-            self._refresh_task.cancel()
+        self._cancel_refresh()
 
         async def _refresh():
-            try:
-                await self._ensure_connected()
-                await self._ensure_subscribed()
-                await self.get_device_status()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self._set_exchange_ok(False)
-                _LOGGER.warning(
-                    "Status refresh after action on %s failed: %s", self.mac, e
-                )
-                await self.delayed_disconnect()
+            async with self._connect_lock:
+                try:
+                    await self._ensure_connected()
+                    await self._ensure_subscribed()
+                    await self.get_device_status()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._set_exchange_ok(False)
+                    _LOGGER.warning(
+                        "Status refresh after action on %s failed: %s", self.mac, e
+                    )
+                    await self.delayed_disconnect()
 
         self._refresh_task = asyncio.get_running_loop().create_task(_refresh())
 
@@ -943,31 +933,17 @@ class SmartMatic:
     async def _ensure_connected(self):
         """Make sure the BLE link is up, without requiring a status read.
 
-        This is the path used for actuating the device (button press): it
+        The caller must hold ``self._connect_lock``. This is the path used
+        for actuating the device (button press): it
         must succeed whenever the device is reachable, even if status
         notifications are currently not coming back, and it ignores the
         polling retry cooldown.
         """
         # Don't let a disconnect timer from the last exchange drop the link
         # mid-command; the action schedules a new one.
-        if self._disconnect_task is not None:
-            self._disconnect_task.cancel()
-            self._disconnect_task = None
-
-        if self.client and self.client.is_connected:
-            return
-
-        waiting_since = asyncio.get_running_loop().time()
-        async with self._connect_lock:
-            # A poll may have been connecting while this waited: if it
-            # failed, so would this, so don't make the user wait twice.
-            failed_at = self._connect_failed_at
-            if failed_at is not None and failed_at >= waiting_since:
-                raise ConnectionError(f"{self.mac} could not be reached just now")
-            _LOGGER.debug("Not connected, connecting to %s...", self.mac)
-            # Subscribing first (one quick call) lets the action catch the
-            # device's acknowledgement.
-            await self._open_connection(settle=ACTION_SETTLE, purpose="command")
+        self._cancel_delayed_disconnect()
+        # Subscribing first lets the action catch its acknowledgement.
+        await self._open_connection(settle=ACTION_SETTLE, purpose="command")
 
     async def _notification_handler(self, sender, data):
         self._on_notification(getattr(sender, "uuid", str(sender)), data)
@@ -1032,9 +1008,11 @@ class SmartMatic:
             _LOGGER.debug("%s: nothing was waiting (it came late)", label)
 
     def _on_disconnect(self, _client: BleakClient):
-        if self._disconnect_task is not None:
-            self._disconnect_task.cancel()
-            self._disconnect_task = None
+        # A late callback from an old link must not clear a newer client.
+        if _client is not self.client:
+            return
+        self._cancel_delayed_disconnect()
 
         self.client = None
+        self._subscribed = False
         self.eventbus.send(DEVICE_DISCONNECT, self)
