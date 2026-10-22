@@ -2,21 +2,33 @@ import logging
 import struct
 from datetime import datetime, timedelta
 
-from .const import SPRAY_CAPACITY
+from . import cbor
+from .const import BATTERY_CURVE, SPRAY_CAPACITY
 
 _LOGGER = logging.getLogger(__name__)
 
 DEVICE_STATUS_VALIDITY_TIME = timedelta(minutes=60)
 
+# Frame length the fixed-offset fallback decoder expects.
 STATUS_LEN = 99
 
-# currentStatus (byte 41) -> auto-spray interval in minutes. The tens digit
+STATUS_REPLY_MT = 157  # fetch-status (107) + 50
+ACK_OK = 200
+
+# currentStatus (cS) -> auto-spray interval in minutes. The tens digit
 # encodes the trigger (spray-now / schedule / button), the units digit the
 # interval. 111 / 0 means idle. Mirrors AppUtility.getCurrentDeviceInterval().
 _INTERVAL_BY_STATUS = {
     112: 10, 121: 10, 131: 10,
     113: 20, 122: 20, 132: 20,
     114: 40, 123: 40, 133: 40,
+}
+
+# sC sub-array -> counter names, in array order.
+_COUNTER_KEYS = {
+    "sn": ("spray_now_0", "spray_now_10", "spray_now_20", "spray_now_40"),
+    "sc": ("schedule_10", "schedule_20", "schedule_40"),
+    "bn": ("button_10", "button_20", "button_40"),
 }
 
 
@@ -28,6 +40,16 @@ def _ascii(data: bytes, start: int, end: int) -> str:
     return data[start:end].decode("ascii", "replace").strip("\x00 ").strip()
 
 
+def _int_or_none(value):
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _str_or_none(value):
+    return value.strip() if isinstance(value, str) else None
+
+
 class DeviceStatus:
     battery_mv: int | None = None
     current_status: int | None = None
@@ -37,11 +59,63 @@ class DeviceStatus:
 
     def __init__(self, status_bytes: bytes):
         self.date = datetime.now()
+        self.raw = bytes(status_bytes)
+        self.message_type = None
+        self.message_id = None
+        self.acknowledgement = None
+        self.spray_counts = {}
 
-        if len(status_bytes) != STATUS_LEN:
+        try:
+            message = cbor.loads(self.raw)
+        except cbor.CBORError as e:
+            _LOGGER.debug("Status frame is not valid CBOR (%s)", e)
+            message = None
+
+        if isinstance(message, dict):
+            self._from_message(message)
+        else:
+            self._from_fixed_offsets(self.raw)
+
+    def _from_message(self, message: dict):
+        self.message_type = message.get("mT")
+        self.message_id = message.get("mN")
+        self.acknowledgement = message.get("ack")
+
+        if self.message_type != STATUS_REPLY_MT:
+            return  # e.g. a command acknowledgement
+        if self.acknowledgement is not None and self.acknowledgement != ACK_OK:
+            _LOGGER.debug("Status reply not acknowledged (ack=%s)", self.acknowledgement)
+            return
+
+        self.battery_mv = _int_or_none(message.get("bV"))
+        self.firmware_version = _str_or_none(message.get("fV"))
+        self.current_status = _int_or_none(message.get("cS"))
+        self.structure_version = _str_or_none(message.get("sV"))
+
+        counters = message.get("sC")
+        if not isinstance(counters, dict):
+            return
+
+        counts = {}
+        for array_key, names in _COUNTER_KEYS.items():
+            values = counters.get(array_key)
+            if not isinstance(values, list):
+                continue
+            for name, value in zip(names, values):
+                value = _int_or_none(value)
+                if value is not None:
+                    counts[name] = value
+
+        if counts:
+            self.spray_counts = counts
+            self.total_spray_count = sum(counts.values())
+
+    def _from_fixed_offsets(self, status_bytes: bytes):
+        """Fallback for frames that are not valid CBOR."""
+        if len(status_bytes) != STATUS_LEN or status_bytes[5] != STATUS_REPLY_MT:
             _LOGGER.debug(
-                "Unexpected status length %d, expected %d",
-                len(status_bytes), STATUS_LEN
+                "Cannot decode status frame (%d bytes): %s",
+                len(status_bytes), status_bytes.hex()
             )
             return
 
@@ -78,6 +152,19 @@ class DeviceStatus:
         if self.battery_mv is None:
             return None
         return round(self.battery_mv / 1000, 3)
+
+    @property
+    def battery_percent(self) -> int | None:
+        """Estimated battery level, 0-100, from the voltage (BATTERY_CURVE)."""
+        mv = self.battery_mv
+        if mv is None:
+            return None
+        if mv >= BATTERY_CURVE[0][0]:
+            return BATTERY_CURVE[0][1]
+        for (hi_mv, hi_pct), (lo_mv, lo_pct) in zip(BATTERY_CURVE, BATTERY_CURVE[1:]):
+            if mv >= lo_mv:
+                return round(lo_pct + (hi_pct - lo_pct) * (mv - lo_mv) / (hi_mv - lo_mv))
+        return 0
 
     @property
     def spray_interval(self) -> int:

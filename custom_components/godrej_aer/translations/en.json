@@ -1,13 +1,15 @@
 {
     "config": {
         "abort": {
-            "already_configured": "Device is already configured"
+            "already_configured": "Device is already configured",
+            "channels_detected": "Detected command channel {command} and reply channel {reply}."
         },
         "error": {
             "cannot_connect": "Failed to connect",
             "invalid_mac": "Invalid MAC address",
             "invalid_device": "This is not a supported Smart Matic device",
-            "unknown": "Unexpected error"
+            "unknown": "Unexpected error",
+            "no_reply": "The device didn't respond. Move it closer to a Bluetooth adapter or proxy, close the Godrej app, and try again."
         },
         "step": {
             "user": {
@@ -26,14 +28,52 @@
                 "title": "Name Device",
                 "data": {
                     "name": "Name"
-                }
+                },
+                "description": "Detected command channel {command} and reply channel {reply}."
+            },
+            "reconfigure": {
+                "title": "Detect channels",
+                "description": "Detect the device's command and reply channels again, for example after a firmware update."
             }
+        },
+        "progress": {
+            "connecting": "Connecting to the device…",
+            "checking_defaults": "Checking the default channels…",
+            "probing": "Checking channel {index} of {total} ({channel})…",
+            "probing_again": "Setting the clock and checking channel {index} of {total} ({channel}) again…"
         }
     },
     "services": {
         "update_status": {
             "name": "Update status",
             "description": "Connects to the Godrej Aer Smart Matic device and refreshes its status. Bypasses the automatic retry cooldown. If no target is given, every configured device is updated."
+        }
+    },
+    "entity": {
+        "binary_sensor": {
+            "bluetooth_link": {
+                "state": {
+                    "on": "Active",
+                    "off": "Idle"
+                }
+            },
+            "status": {
+                "state": {
+                    "on": "OK",
+                    "off": "Unreachable"
+                }
+            }
+        }
+    },
+    "exceptions": {
+        "command_not_confirmed": {
+            "message": "The air freshener didn't confirm the command. Check that it's in range and try again."
+        },
+        "cannot_reach": {
+            "message": "Couldn't reach the air freshener. Check that it's switched on and in range, and try again."
+        },
+        "battery_too_low": {
+            "message": "Batteries are too low to spray. Replace them."
         }
     }
 }

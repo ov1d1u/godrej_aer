@@ -8,8 +8,9 @@ from homeassistant.const import Platform, CONF_MAC
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 
+from .const import CONF_COMMAND_CHAR, CONF_REPLY_CHAR
 from .godrej import SmartMatic
 from .services import async_setup_services, async_unload_services
 
@@ -30,17 +31,53 @@ async def async_setup_entry(
 
     mac = entry.options.get(CONF_MAC, None) or entry.data.get(CONF_MAC, None)
 
-    instance = SmartMatic(hass, mac)
+    instance = SmartMatic(
+        hass,
+        mac,
+        command_char=entry.data.get(CONF_COMMAND_CHAR),
+        reply_char=entry.data.get(CONF_REPLY_CHAR),
+    )
     entry.runtime_data = instance
 
     async_setup_services(hass)
 
+    retry_timer = None
+
+    @callback
+    def _cancel_retry_timer():
+        nonlocal retry_timer
+        if retry_timer is not None:
+            retry_timer()
+            retry_timer = None
+
+    entry.async_on_unload(_cancel_retry_timer)
+
     async def _connect_if_needed():
+        nonlocal retry_timer
         if bluetooth.async_address_present(hass, mac, connectable=True):
             try:
                 await instance.connect_if_needed()
             except Exception:
                 _LOGGER.debug("Background connect attempt failed for %s", mac, exc_info=True)
+                # Retry exactly when the backoff ends, not at the next
+                # periodic tick (up to a minute later).
+                delay = instance.retry_delay
+                if delay is not None:
+                    _cancel_retry_timer()
+                    retry_timer = async_call_later(hass, delay + 0.5, _retry_now)
+
+    @callback
+    def _retry_now(_now) -> None:
+        nonlocal retry_timer
+        retry_timer = None
+        _schedule_connect()
+
+    @callback
+    def _schedule_connect():
+        # Don't delay startup; cancelled on unload.
+        entry.async_create_background_task(
+            hass, _connect_if_needed(), f"godrej_aer connect {mac}"
+        )
 
     @callback
     def _async_discovered_device(
@@ -49,7 +86,15 @@ async def async_setup_entry(
     ):
         """Subscribe to bluetooth changes."""
         _LOGGER.debug("New service_info: %s", service_info)
-        hass.async_create_task(_connect_if_needed())
+        instance.set_advertising(True)
+        _schedule_connect()
+
+    @callback
+    def _async_device_unavailable(
+        service_info: bluetooth.BluetoothServiceInfoBleak,
+    ) -> None:
+        # No advertisements for a while: out of range or out of battery.
+        instance.set_advertising(False)
 
     entry.async_on_unload(
         bluetooth.async_register_callback(
@@ -59,19 +104,24 @@ async def async_setup_entry(
             bluetooth.BluetoothScanningMode.PASSIVE
         )
     )
+    entry.async_on_unload(
+        bluetooth.async_track_unavailable(
+            hass, _async_device_unavailable, mac, connectable=True
+        )
+    )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     @callback
     def _async_periodic_connect(_now):
-        hass.async_create_task(_connect_if_needed())
+        _schedule_connect()
 
     entry.async_on_unload(
         async_track_time_interval(hass, _async_periodic_connect, timedelta(seconds=60))
     )
 
-    await _connect_if_needed()
+    _schedule_connect()
 
     return True
 

@@ -36,12 +36,25 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.client = SimpleNamespace(is_connected=True, write_gatt_char=AsyncMock(),
                                       disconnect=AsyncMock())
         self.device.client = self.client
+        self.device._subscribed = True
+        self.client.write_gatt_char.side_effect = self.confirm_write
+        # These tests isolate link ownership; read-back is covered separately.
+        self.refresh_patch = patch.object(self.device, "_schedule_refresh", Mock())
+        self.refresh_patch.start()
+        self.addCleanup(self.refresh_patch.stop)
+
+    async def confirm_write(self, char, payload):
+        message_type = driver.cbor.loads(payload)["mT"]
+        if message_type in (104, 105, 106):
+            self.device._handle_message(driver.encode_message(
+                mT=message_type + 50, mN=message_type + 50, ack=200))
 
     async def asyncTearDown(self):
-        task = self.device._disconnect_task
-        if task is not None:
+        tasks = [task for task in (self.device._disconnect_task, self.device._refresh_task)
+                 if task is not None]
+        for task in tasks:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def test_missing_client_is_connection_error(self):
         self.device.client = None
@@ -68,7 +81,7 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.device.client, self.client)
         await self.device.spray_now()
         self.client.write_gatt_char.assert_awaited_once_with(
-            driver.WRITE_CHAR, driver.SPRAY_NOW_MSG)
+            driver.DEFAULT_COMMAND_CHAR, driver.SPRAY_NOW_MSG)
 
     async def test_action_waits_for_poll_and_reconnects_after_cleanup(self):
         entered = asyncio.Event()
@@ -79,9 +92,10 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
             await finish.wait()
             raise driver.ConnectionError("No status")
 
-        async def open_link():
+        async def open_link(**kwargs):
             if self.device.client is None:
                 self.device.client = self.client
+                self.device._subscribed = True
 
         with patch.object(self.device, "_open_connection", open_link), \
              patch.object(self.device, "_set_time", AsyncMock()), \
@@ -96,7 +110,7 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
                 await poll
             await action
         self.client.write_gatt_char.assert_awaited_once_with(
-            driver.WRITE_CHAR, driver.SPRAY_NOW_MSG)
+            driver.DEFAULT_COMMAND_CHAR, driver.SPRAY_NOW_MSG)
 
     async def test_pending_disconnect_is_cancelled_before_action(self):
         await self.device.delayed_disconnect()
@@ -107,6 +121,16 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.client.disconnect.assert_not_awaited()
         self.client.write_gatt_char.assert_awaited_once()
 
+    async def test_poll_cancels_a_pending_disconnect(self):
+        await self.device.delayed_disconnect()
+        old_task = self.device._disconnect_task
+        with patch.object(self.device, "_set_time", AsyncMock()), \
+             patch.object(self.device, "get_device_status", AsyncMock()):
+            await self.device.connect()
+        await asyncio.sleep(0)
+        self.assertTrue(old_task.cancelled())
+        self.client.disconnect.assert_not_awaited()
+
     async def test_disconnect_waits_for_in_flight_action(self):
         entered = asyncio.Event()
         finish = asyncio.Event()
@@ -114,6 +138,7 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         async def write(*args):
             entered.set()
             await finish.wait()
+            await self.confirm_write(*args)
 
         self.client.write_gatt_char.side_effect = write
         action = asyncio.create_task(self.device.spray_now())
@@ -128,9 +153,94 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_write_is_reported_without_retry(self):
         self.client.write_gatt_char.side_effect = RuntimeError("Link lost")
-        with self.assertRaisesRegex(driver.ConnectionError, "Link lost"):
+        with self.assertRaises(driver.CommandNotConfirmed):
             await self.device.spray_now()
         self.client.write_gatt_char.assert_awaited_once()
+
+    async def test_safe_write_reports_ble_error(self):
+        self.client.write_gatt_char.side_effect = RuntimeError("Link lost")
+        with self.assertRaisesRegex(driver.ConnectionError, "Link lost"):
+            await self.device._write_message(driver.SPRAY_NOW_MSG)
+        self.client.write_gatt_char.assert_awaited_once()
+
+    async def test_safe_write_uses_the_requested_channel(self):
+        await self.device._write_message(driver.SPRAY_NOW_MSG, char="other-channel")
+        self.client.write_gatt_char.assert_awaited_once_with(
+            "other-channel", driver.SPRAY_NOW_MSG)
+
+    async def test_disconnect_waits_for_command_ack(self):
+        written = asyncio.Event()
+
+        async def write(*args):
+            written.set()
+
+        self.client.write_gatt_char.side_effect = write
+        action = asyncio.create_task(self.device.spray_now())
+        await written.wait()
+        disconnect = asyncio.create_task(self.device.disconnect())
+        await asyncio.sleep(0)
+        self.client.disconnect.assert_not_awaited()
+        self.device._handle_message(driver.encode_message(mT=154, mN=154, ack=200))
+        await asyncio.wait_for(action, 1)
+        await asyncio.wait_for(disconnect, 1)
+        self.client.disconnect.assert_awaited_once()
+
+    async def test_delayed_disconnect_does_not_cancel_itself(self):
+        with patch.object(driver, "DISCONNECT_DELAY", 0):
+            await self.device.delayed_disconnect()
+            task = self.device._disconnect_task
+            await asyncio.wait_for(task, 1)
+        self.assertFalse(task.cancelled())
+        self.assertIsNone(self.device._disconnect_task)
+        self.client.disconnect.assert_awaited_once()
+
+    async def test_background_refresh_waits_for_poll(self):
+        self.refresh_patch.stop()
+        entered = asyncio.Event()
+        finish = asyncio.Event()
+        calls = 0
+
+        async def status(**kwargs):
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await finish.wait()
+
+        with patch.object(self.device, "_set_time", AsyncMock()), \
+             patch.object(self.device, "get_device_status", status):
+            poll = asyncio.create_task(self.device.connect())
+            await entered.wait()
+            self.device._schedule_refresh()
+            await asyncio.sleep(0)
+            self.assertEqual(calls, 1)
+            finish.set()
+            await asyncio.wait_for(poll, 1)
+            await asyncio.wait_for(self.device._refresh_task, 1)
+        self.assertEqual(calls, 2)
+
+    async def test_new_action_cancels_an_in_flight_refresh(self):
+        self.refresh_patch.stop()
+        entered = asyncio.Event()
+        finish = asyncio.Event()
+        calls = 0
+
+        async def status(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                await finish.wait()
+
+        with patch.object(self.device, "get_device_status", status):
+            self.device._schedule_refresh()
+            old_refresh = self.device._refresh_task
+            await entered.wait()
+            await asyncio.wait_for(self.device.spray_now(), 1)
+            await asyncio.wait_for(self.device._refresh_task, 1)
+        self.assertTrue(old_refresh.cancelled())
+        self.assertEqual(calls, 2)
+        self.client.write_gatt_char.assert_awaited_once_with(
+            driver.DEFAULT_COMMAND_CHAR, driver.SPRAY_NOW_MSG)
 
 
 if __name__ == "__main__":

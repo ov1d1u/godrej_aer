@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -14,7 +15,7 @@ from homeassistant.components.bluetooth import (
     async_discovered_service_info
 )
 
-from .const import DOMAIN
+from .const import CONF_COMMAND_CHAR, CONF_REPLY_CHAR, DOMAIN
 from .godrej import SmartMatic
 from .godrej.exception import InvalidDeviceError, ConnectionError
 
@@ -29,20 +30,35 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self):
         self.name = "Godrej Aer Smart Matic"
         self.mac = None
+        self.command_char = None
+        self.reply_char = None
         self._manual_entry = False
+        self._smartmatic: SmartMatic | None = None
+        self._detect_task: asyncio.Task | None = None
+        self._detect_error: str | None = None
+        self._stage: tuple[str, dict] = ("connecting", {})
+        self._stage_changed = asyncio.Event()
+        self._waiter: asyncio.Task | None = None
 
     def _is_device_supported(self, device_info):
         name = device_info.name or ""
         return "smart matic" in name.lower()
 
-    async def _validate_device(self, smartmatic):
-        # Getting the BLE link up and confirming the device looks right is
-        # enough to add it. The status read may not work over every transport
-        # (an ESPHome Bluetooth proxy cannot enable notifications on this
-        # device's status characteristic, which has no CCC descriptor), so a
-        # status timeout here must not block setup - keep the wait short.
-        if not await smartmatic.connect(require_status=False, status_timeout=10):
-            raise ConnectionError("Unable to connect")
+    async def _detect(self, smartmatic: SmartMatic) -> str | None:
+        """Detect the channels; return an error key, or None on success."""
+        try:
+            channels = await smartmatic.detect_channels(progress=self._on_progress)
+        except InvalidDeviceError:
+            return "invalid_device"
+        except ConnectionError:
+            return "cannot_connect"
+        except Exception:
+            _LOGGER.exception("Unexpected error while validating %s", self.mac)
+            return "unknown"
+        if channels is None:
+            return "no_reply"
+        self.command_char, self.reply_char = channels
+        return None
 
     async def async_step_user(
         self,
@@ -123,27 +139,108 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_validate(
         self, user_input: "dict[str, Any] | None" = None
     ) -> ConfigFlowResult:
-        """Handle validate step."""
-        error = None
-        smartmatic = SmartMatic(self.hass, self.mac)
+        """Start detecting the device's channels."""
+        self._smartmatic = SmartMatic(self.hass, self.mac)
+        return await self.async_step_detect()
+
+    def _on_progress(self, stage: str, details: dict, fraction: float) -> None:
+        self._stage = (stage, details)
+        self.async_update_progress(fraction)
+        self._stage_changed.set()
+
+    async def _run_detection(self) -> None:
         try:
-            await self._validate_device(smartmatic)
-        except InvalidDeviceError:
-            error = "invalid_device"
-        except ConnectionError:
-            error = "cannot_connect"
-        except Exception:
-            _LOGGER.exception("Unexpected error while validating %s", self.mac)
-            error = "unknown"
+            self._detect_error = await self._detect(self._smartmatic)
         finally:
-            await smartmatic.disconnect()
+            if self._reconfigure_entry_id is None:
+                await self._smartmatic.disconnect()
+
+    @property
+    def _reconfigure_entry_id(self) -> str | None:
+        return self.context.get("entry_id") if self.source == "reconfigure" else None
+
+    async def async_step_detect(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show what detection is doing, step by step."""
+        # The frontend re-runs this step whenever it refreshes the dialog,
+        # so it must be safe to enter repeatedly: one detection, and one
+        # waiter per stage. Home Assistant continues the flow when the
+        # waiter finishes (the stage changed or detection ended).
+        if self._detect_task is None:
+            self._detect_task = self.hass.async_create_task(self._run_detection())
+        if self._detect_task.done():
+            return self.async_show_progress_done(next_step_id="detect_done")
+
+        if self._waiter is None or self._waiter.done():
+            self._stage_changed.clear()
+            self._waiter = self.hass.async_create_task(
+                _first_of(self._detect_task, self._stage_changed.wait())
+            )
+        stage, details = self._stage
+        return self.async_show_progress(
+            step_id="detect",
+            progress_action=stage,
+            description_placeholders=details,
+            progress_task=self._waiter,
+        )
+
+    async def async_step_detect_done(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        error = self._detect_error
+        # Allow another attempt (e.g. after an error, from the form).
+        self._detect_task = self._waiter = None
+        if self._reconfigure_entry_id is not None:
+            if error:
+                return await self.async_step_reconfigure(errors={"base": error})
+            entry = self._get_reconfigure_entry()
+            self.hass.config_entries.async_update_entry(
+                entry,
+                data={
+                    **entry.data,
+                    CONF_COMMAND_CHAR: self.command_char,
+                    CONF_REPLY_CHAR: self.reply_char,
+                },
+            )
+            self.hass.config_entries.async_schedule_reload(entry.entry_id)
+            return self.async_abort(
+                reason="channels_detected",
+                description_placeholders=self._channel_placeholders(),
+            )
 
         if error:
             if self._manual_entry:
                 return await self.async_step_manual_mac(errors={"base": error})
             return await self.async_step_user(errors={"base": error})
-
         return await self.async_step_name()
+
+    def _channel_placeholders(self) -> dict[str, str]:
+        return {"command": _short(self.command_char), "reply": _short(self.reply_char)}
+
+    def async_remove(self) -> None:
+        """Stop detection if the dialog is closed while it runs."""
+        if self._detect_task is not None:
+            self._detect_task.cancel()
+
+    async def async_step_reconfigure(
+        self,
+        user_input: dict[str, Any] | None = None,
+        errors: dict[str, str] | None = None,
+    ) -> ConfigFlowResult:
+        """Detect the command and reply channels again."""
+        entry = self._get_reconfigure_entry()
+        if user_input is not None:
+            self.mac = entry.options.get(CONF_MAC) or entry.data[CONF_MAC]
+            # The device takes one connection: use the loaded instance.
+            instance = getattr(entry, "runtime_data", None)
+            if not isinstance(instance, SmartMatic):
+                instance = SmartMatic(self.hass, self.mac)
+            self._smartmatic = instance
+            return await self.async_step_detect()
+
+        return self.async_show_form(step_id="reconfigure", errors=errors or {})
+
 
     async def async_step_name(
         self, user_input: dict[str, Any] | None = None
@@ -156,7 +253,9 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
                 title=self.name,
                 data = {
                     CONF_MAC: self.mac,
-                    CONF_NAME: self.name
+                    CONF_NAME: self.name,
+                    CONF_COMMAND_CHAR: self.command_char,
+                    CONF_REPLY_CHAR: self.reply_char,
                 }
             )
 
@@ -167,5 +266,18 @@ class GodrejAerConfigFlow(ConfigFlow, domain=DOMAIN):
                     vol.Required(CONF_NAME, default=self.name): str
                 }
             ),
+            description_placeholders=self._channel_placeholders(),
             errors={},
         )
+
+def _short(uuid: str | None) -> str:
+    return uuid[:8] if uuid else "not detected"
+
+
+async def _first_of(*aws) -> None:
+    """Wait until any of the given awaitables finishes."""
+    tasks = [asyncio.ensure_future(aw) for aw in aws]
+    _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        if task is not tasks[0]:  # never cancel the detection itself
+            task.cancel()

@@ -7,7 +7,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .entity import async_device_device_info_fn
+from .entity import AcceptedButFlat, async_device_device_info_fn, async_send_command
 from .godrej import SmartMatic, DeviceStatus
 from .godrej.const import DEFAULT_SPRAY_INTERVAL
 from .godrej.events import DEVICE_STATUS_UPDATE
@@ -30,7 +30,8 @@ class SmartMaticAutoSpraySwitch(SwitchEntity):
     def __init__(self, instance: SmartMatic, config_entry: ConfigEntry):
         self._instance = instance
         self._config_entry = config_entry
-        self._attr_name = f"{config_entry.data[CONF_NAME]} Auto Spray"
+        self._attr_has_entity_name = True
+        self._attr_name = "Spray: auto"
         self._attr_unique_id = f"{config_entry.entry_id}_auto_spray"
         # Interval to resume at when toggled on; tracks the last active one.
         self._last_interval = DEFAULT_SPRAY_INTERVAL
@@ -54,10 +55,30 @@ class SmartMaticAutoSpraySwitch(SwitchEntity):
         )
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self._instance.set_spray_interval(self._last_interval)
+        await self._command(self._instance.set_spray_interval(self._last_interval), True)
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._instance.stop_spray()
+        await self._command(self._instance.stop_spray(), False)
+
+    async def _command(self, command, is_on: bool) -> None:
+        """Show the new state once the device acknowledges the command.
+
+        Otherwise re-write the current state, so the toggle flips back,
+        and raise; the status read-back that follows shows what the device
+        is really doing.
+        """
+        try:
+            await async_send_command(command)
+        except AcceptedButFlat:
+            # The device did switch modes; it just can't spray.
+            self._attr_is_on = is_on
+            self.async_write_ha_state()
+            raise
+        except Exception:
+            self.async_write_ha_state()
+            raise
+        self._attr_is_on = is_on
+        self.async_write_ha_state()
 
     async def on_status_update(self, device_status: DeviceStatus):
         if device_status.is_spraying:

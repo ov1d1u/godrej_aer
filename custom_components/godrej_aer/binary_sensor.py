@@ -1,52 +1,103 @@
 from __future__ import annotations
 
-from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
+from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME
 from homeassistant.helpers.entity import EntityCategory, DeviceInfo
 
 from .entity import async_device_device_info_fn
 from .godrej import SmartMatic
-from .godrej.events import DEVICE_DISCONNECT, DEVICE_CONNECT
+from .godrej.events import (
+    DEVICE_CONNECT,
+    DEVICE_DISCONNECT,
+    DEVICE_REACHABILITY,
+    DEVICE_STATUS_UPDATE,
+)
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
     instance: SmartMatic = config_entry.runtime_data
     async_add_entities([
-        SmartMaticConnectedBinarySensor(instance, config_entry)
+        SmartMaticReachableBinarySensor(instance, config_entry),
+        SmartMaticBluetoothLinkBinarySensor(instance, config_entry),
     ])
 
 
-class SmartMaticConnectedBinarySensor(BinarySensorEntity):
-    """Representation of a Smart Matic connected binary sensor."""
+class SmartMaticBinarySensor(BinarySensorEntity):
+    _events: tuple[str, ...] = ()
+    _attr_has_entity_name = True
 
     def __init__(self, instance: SmartMatic, config_entry: ConfigEntry):
         self._instance: SmartMatic = instance
         self._config_entry = config_entry
-        self._attr_name = f"{config_entry.data[CONF_NAME]} Connected"
-        self._attr_unique_id = f"{config_entry.entry_id}_is_connected"
-        self._attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
         self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_is_on = False
-        self._attr_icon = "mdi:bluetooth-off"
 
     async def async_added_to_hass(self) -> None:
-        self._instance.eventbus.add_listener(DEVICE_CONNECT, self.on_connect)
-        self._instance.eventbus.add_listener(DEVICE_DISCONNECT, self.on_disconnect)
+        for event in self._events:
+            self._instance.eventbus.add_listener(event, self.on_event)
 
     async def async_will_remove_from_hass(self) -> None:
-        self._instance.eventbus.remove_listener(DEVICE_CONNECT, self.on_connect)
-        self._instance.eventbus.remove_listener(DEVICE_DISCONNECT, self.on_disconnect)
+        for event in self._events:
+            self._instance.eventbus.remove_listener(event, self.on_event)
 
     @property
     def device_info(self) -> DeviceInfo:
         return async_device_device_info_fn(self._instance, self._config_entry.data[CONF_NAME])
 
-    async def on_connect(self, instance: SmartMatic):
-        self._attr_is_on = True
-        self._attr_icon = "mdi:bluetooth-connect"
+    async def on_event(self, _data) -> None:
         self.async_write_ha_state()
 
-    async def on_disconnect(self, instance: SmartMatic):
-        self._attr_is_on = False
-        self._attr_icon = "mdi:bluetooth-off"
-        self.async_write_ha_state()
+
+class SmartMaticReachableBinarySensor(SmartMaticBinarySensor):
+    """OK / Unreachable. Unreachable only on real trouble: a failed exchange,
+    or no advertisements. The link is dropped after every exchange to save
+    battery, so that says nothing about the device's health.
+    """
+
+    _events = (DEVICE_REACHABILITY, DEVICE_STATUS_UPDATE)
+    _attr_name = "Connection status"
+    _attr_translation_key = "status"
+
+    def __init__(self, instance: SmartMatic, config_entry: ConfigEntry):
+        super().__init__(instance, config_entry)
+        self._attr_unique_id = f"{config_entry.entry_id}_reachable"
+
+    @property
+    def is_on(self) -> bool | None:
+        return self._instance.reachable
+
+    @property
+    def icon(self) -> str:
+        return "mdi:check-circle-outline" if self.is_on is not False else "mdi:alert-circle-outline"
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        # An attribute rather than a timestamp sensor: attribute changes
+        # don't add activity log entries.
+        last = self._instance.last_update
+        return {"last_update": last.isoformat() if last else None}
+
+
+class SmartMaticBluetoothLinkBinarySensor(SmartMaticBinarySensor):
+    """Whether a Bluetooth link is open right now (Active/Idle).
+
+    Normal operation opens and closes it constantly, so it is disabled by
+    default; enable it to debug connections.
+    """
+
+    _events = (DEVICE_CONNECT, DEVICE_DISCONNECT)
+    _attr_name = "Connection link"
+    _attr_translation_key = "bluetooth_link"
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, instance: SmartMatic, config_entry: ConfigEntry):
+        super().__init__(instance, config_entry)
+        self._attr_unique_id = f"{config_entry.entry_id}_bluetooth_link"
+
+    @property
+    def is_on(self) -> bool:
+        client = self._instance.client
+        return bool(client and client.is_connected)
+
+    @property
+    def icon(self) -> str:
+        return "mdi:bluetooth-connect" if self.is_on else "mdi:bluetooth"
