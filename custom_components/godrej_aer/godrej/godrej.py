@@ -162,6 +162,7 @@ class SmartMatic:
         caps how long to wait for that status frame.
         """
         async with self._connect_lock:
+            self._cancel_delayed_disconnect()
             await self._open_connection()
 
             try:
@@ -335,7 +336,18 @@ class SmartMatic:
 
         return True
 
+    def _cancel_delayed_disconnect(self):
+        task = self._disconnect_task
+        self._disconnect_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
     async def disconnect(self):
+        async with self._connect_lock:
+            self._cancel_delayed_disconnect()
+            return await self._disconnect()
+
+    async def _disconnect(self):
         if self.client and self.client.is_connected:
             _LOGGER.debug("Disconnecting from %s...", self.mac)
             await self.client.disconnect()
@@ -352,10 +364,10 @@ class SmartMatic:
         """
         client = self.client
         self.client = None
+        if client is not None:
+            self.eventbus.send(DEVICE_DISCONNECT, self)
 
-        if self._disconnect_task is not None:
-            self._disconnect_task.cancel()
-            self._disconnect_task = None
+        self._cancel_delayed_disconnect()
 
         if client is None:
             return
@@ -375,22 +387,22 @@ class SmartMatic:
             try:
                 _LOGGER.debug("Waiting %ss before disconnecting from %s...", DISCONNECT_DELAY, self.mac)
                 await asyncio.sleep(DISCONNECT_DELAY)
-                if refresh:
-                    try:
-                        await self.get_device_status()
-                    except Exception as e:
-                        _LOGGER.warning(
-                            "Status refresh after action on %s failed: %s",
-                            self.mac, e
-                        )
-                await self.disconnect()
+                async with self._connect_lock:
+                    if refresh:
+                        try:
+                            await self.get_device_status()
+                        except Exception as e:
+                            _LOGGER.warning(
+                                "Status refresh after action on %s failed: %s",
+                                self.mac, e
+                            )
+                    await self._disconnect()
             except Exception as e:
                 _LOGGER.debug("Failed to disconnect. Error: %s", e)
 
         _LOGGER.debug("Scheduling delayed disconnect from %s...", self.mac)
         loop = asyncio.get_running_loop()
-        if self._disconnect_task is not None:
-            self._disconnect_task.cancel()
+        self._cancel_delayed_disconnect()
         self._disconnect_task = loop.create_task(_delayed_disconnect())
 
     async def _set_time(self):
@@ -410,7 +422,7 @@ class SmartMatic:
 
         _LOGGER.debug(">> %s: %s (set time)", WRITE_CHAR, payload.hex())
         try:
-            await self.client.write_gatt_char(WRITE_CHAR, payload)
+            await self._write_message(payload)
         except Exception as e:
             _LOGGER.debug("Failed to set time on %s: %s", self.mac, e)
             return
@@ -425,7 +437,7 @@ class SmartMatic:
         self._device_status_event.clear()
 
         _LOGGER.debug("Writing to %s on %s...", WRITE_CHAR, self.mac)
-        await self.client.write_gatt_char(WRITE_CHAR, FETCH_STATUS_MSG)
+        await self._write_message(FETCH_STATUS_MSG)
 
         try:
             _LOGGER.debug("Waiting for device status from %s...", self.mac)
@@ -454,19 +466,28 @@ class SmartMatic:
         refreshes status just before the delayed disconnect, so the action
         returns without waiting for a status response.
         """
-        await self._ensure_connected()
+        async with self._connect_lock:
+            self._cancel_delayed_disconnect()
+            await self._open_connection()
 
-        # Stop a pending refresh/disconnect while sending the next command.
-        if self._disconnect_task is not None:
-            self._disconnect_task.cancel()
-            self._disconnect_task = None
+            try:
+                _LOGGER.debug(">> %s: %s", WRITE_CHAR, payload.hex())
+                await self._write_message(payload)
+            finally:
+                await self.delayed_disconnect(refresh=refresh)
 
+    async def _write_message(self, payload: bytes):
+        """Use a stable client reference and report BLE failures to HA."""
+        client = self.client
+        if client is None or not client.is_connected:
+            raise ConnectionError(f"Device {self.mac} is not connected over Bluetooth")
         try:
-            _LOGGER.debug(">> %s: %s", WRITE_CHAR, payload.hex())
-            await self.client.write_gatt_char(WRITE_CHAR, payload)
-            _LOGGER.debug("Write complete.")
-        finally:
-            await self.delayed_disconnect(refresh=refresh)
+            await client.write_gatt_char(WRITE_CHAR, payload)
+        except Exception as e:
+            # Do not retry: an action may have reached the device already.
+            raise ConnectionError(
+                f"Failed to send command to device {self.mac}: {e}"
+            ) from e
 
     async def spray_now(self):
         """Spray once, now."""
@@ -500,21 +521,6 @@ class SmartMatic:
         _LOGGER.debug("Reset refill on %s...", self.mac)
         await self._write_action(RESET_REFILL_MSG)
 
-    async def _ensure_connected(self):
-        """Make sure the BLE link is up, without requiring a status read.
-
-        This is the path used for actuating the device (button press): it
-        must succeed whenever the device is reachable, even if status
-        notifications are currently not coming back, and it ignores the
-        polling retry cooldown.
-        """
-        if self.client and self.client.is_connected:
-            return
-
-        async with self._connect_lock:
-            _LOGGER.debug("Not connected, connecting to %s...", self.mac)
-            await self._open_connection()
-
     async def _notification_handler(self, sender, data):
         uuid = getattr(sender, "uuid", sender)
         _LOGGER.debug("<< %s: %s", uuid, data.hex())
@@ -535,9 +541,10 @@ class SmartMatic:
         self.eventbus.send(DEVICE_STATUS_UPDATE, self.device_status)
 
     def _on_disconnect(self, _client: BleakClient):
-        if self._disconnect_task is not None:
-            self._disconnect_task.cancel()
-            self._disconnect_task = None
+        # A late callback from an old link must not clear a newer client.
+        if _client is not self.client:
+            return
+        self._cancel_delayed_disconnect()
 
         self.client = None
         self.eventbus.send(DEVICE_DISCONNECT, self)
