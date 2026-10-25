@@ -730,6 +730,22 @@ async def test_background_check_recovers_after_a_failed_press(monkeypatch):
     assert not await matic.connect_if_needed()  # and quiet again
 
 
+async def test_press_during_a_slow_status_reply_is_not_held_up(monkeypatch):
+    device = FakeDevice(command_char=C4, status_frame=FRAME_308_IN, reply_delay=0.5)
+    matic = attach(monkeypatch, device, command_char=C4, reply_char=C1)
+    monkeypatch.setattr(gm, "SET_TIME_PACING", 0)
+    loop = asyncio.get_running_loop()
+
+    poll = asyncio.ensure_future(matic.connect(status_timeout=5))
+    while not any(cbor.loads(p)["mT"] == 107 for _, p in device.writes):
+        await asyncio.sleep(0.01)  # the poll is now waiting for its reply
+    start = loop.time()
+    await matic.spray_now()
+    assert loop.time() - start < 0.3  # well before the 0.5 s reply
+    assert await poll
+    matic._refresh_task.cancel()
+
+
 async def test_press_cancels_a_pending_disconnect(monkeypatch):
     device = FakeDevice(command_char=C4, status_frame=FRAME_308_IN)
     matic = attach(monkeypatch, device, command_char=C4, reply_char=C1)

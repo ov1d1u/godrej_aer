@@ -48,6 +48,9 @@ from .events import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Seconds between the set-time message and the next one, as the app does.
+SET_TIME_PACING = 1.0
+
 # Limits for reassembling frames split over several notifications.
 _MAX_FRAME_LEN = 512
 _FRAGMENT_TIMEOUT = 2.0
@@ -197,6 +200,11 @@ class SmartMatic:
         # one at a time (``_command_lock``), so at most one waits per type.
         self._ack_waiters: dict[int, asyncio.Future] = {}
         self._command_lock = asyncio.Lock()
+        # Counts commands, so a failed status read can tell whether a press
+        # used the link while it waited (see _close_after_failed_read).
+        self._commands_sent = 0
+        # A status read may be waiting for its reply without holding the lock.
+        self._reading_status = False
         # Loop time of the last failed connect, so queued commands give up
         # at once instead of each waiting out their own attempts.
         self._connect_failed_at: float | None = None
@@ -243,19 +251,72 @@ class SmartMatic:
         return self._command_char
 
     async def connect(self, *, status_timeout: float = STATUS_TIMEOUT) -> bool:
-        """Open the BLE link and fetch a fresh device status."""
+        """Open the BLE link and fetch a fresh device status.
+
+        The link lock is held only while the link is opened and messages
+        are written. The pauses in between and the wait for the reply run
+        outside it, so a button press can use the open link straight away
+        instead of queueing behind a status read.
+        """
+        if self._reading_status:
+            raise ConnectionError(f"A status read from {self.mac} is already in progress")
+        self._reading_status = True
+        try:
+            return await self._connect_and_read(status_timeout)
+        finally:
+            self._reading_status = False
+
+    async def _connect_and_read(self, status_timeout: float) -> bool:
+        commands_before = self._commands_sent
         async with self._connect_lock:
             self._cancel_delayed_disconnect()
             await self._open_connection()
-
             try:
-                await self._set_time()
-                await self.get_device_status(timeout=status_timeout)
+                await self._set_time(pace=False)
             except BaseException:
                 await self._cleanup_connection()
                 raise
 
+        try:
+            # Match the app's pacing between messages.
+            await asyncio.sleep(SET_TIME_PACING)
+            async with self._connect_lock:
+                self._device_status_event.clear()
+                _LOGGER.debug(">> %s: %s (fetch status)", self._write_char, FETCH_STATUS_MSG.hex())
+                await self._write_message(FETCH_STATUS_MSG)
+            await self._await_status_reply(status_timeout)
+        except BaseException:
+            await self._close_after_failed_read(commands_before)
+            raise
+
+        # Got a fresh status, clear any retry cooldown from earlier failures.
+        self._retry_after = None
+        self._poll_failures = 0
+        await self.delayed_disconnect()
         return True
+
+    async def _await_status_reply(self, timeout: float) -> None:
+        """Wait for the status reply, without holding the link lock."""
+        _LOGGER.debug("Waiting for device status from %s...", self.mac)
+        try:
+            await asyncio.wait_for(self._device_status_event.wait(), timeout)
+        except asyncio.TimeoutError:
+            raise ConnectionError(
+                f"Timeout waiting for device status response from {self.mac}"
+            ) from None
+
+    async def _close_after_failed_read(self, commands_before: int) -> None:
+        """Don't leave the link open after a failed status read.
+
+        Waits for the lock, so a command using the link finishes first. If
+        a command did use the link meanwhile, it is closed after the usual
+        delay instead, like after any other exchange.
+        """
+        async with self._connect_lock:
+            if self._commands_sent != commands_before and self.client is not None:
+                await self.delayed_disconnect()
+            else:
+                await self._cleanup_connection()
 
     async def _open_connection(
         self, *, subscribe: bool = True, settle: float = 2.0,
@@ -481,7 +542,7 @@ class SmartMatic:
             )
             return False
 
-        if self._connect_lock.locked():
+        if self._connect_lock.locked() or self._reading_status:
             _LOGGER.debug(
                 "Skipping connect to %s, an attempt is already in progress",
                 self.mac
@@ -642,7 +703,7 @@ class SmartMatic:
         self._cancel_delayed_disconnect()
         self._disconnect_task = loop.create_task(_delayed_disconnect())
 
-    async def _set_time(self, char: str | None = None):
+    async def _set_time(self, char: str | None = None, *, pace: bool = True):
         """Push the current time to the device before reading status.
 
         The official app sends this on every connect. Some devices (in
@@ -665,8 +726,9 @@ class SmartMatic:
             _LOGGER.debug("Failed to set time on %s: %s", self.mac, e)
             return
 
-        # Match the app's pacing between messages.
-        await asyncio.sleep(1.0)
+        if pace:
+            # Match the app's pacing between messages.
+            await asyncio.sleep(SET_TIME_PACING)
 
     async def get_device_status(self, *, timeout: float = STATUS_TIMEOUT):
         _LOGGER.debug("Getting device status from %s...", self.mac)
@@ -813,6 +875,7 @@ class SmartMatic:
                 await self._send_command(payload, reply_mt)
 
     async def _send_command(self, payload: bytes, reply_mt: int):
+        self._commands_sent += 1
         try:
             await self._ensure_connected()
             await self._ensure_subscribed()
