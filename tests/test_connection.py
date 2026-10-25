@@ -147,6 +147,56 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.client.write_gatt_char.assert_any_await(
             driver.DEFAULT_COMMAND_CHAR, driver.SPRAY_NOW_MSG)
 
+    async def test_update_status_during_a_read_shares_its_result(self):
+        entered = asyncio.Event()
+        finish = asyncio.Event()
+        opened = 0
+
+        async def open_link(**kwargs):
+            nonlocal opened
+            opened += 1
+
+        async def reply(timeout):
+            entered.set()
+            await finish.wait()
+
+        with patch.object(self.device, "_open_connection", open_link), \
+             patch.object(self.device, "_set_time", AsyncMock()), \
+             patch.object(driver, "SET_TIME_PACING", 0), \
+             patch.object(self.device, "_await_status_reply", reply):
+            poll = asyncio.create_task(self.device.connect())
+            await entered.wait()
+            update = asyncio.create_task(self.device.connect())
+            await asyncio.sleep(0)
+            self.assertFalse(update.done())  # waits instead of failing
+            finish.set()
+            self.assertTrue(await poll)
+            self.assertTrue(await update)
+        self.assertEqual(opened, 1)  # one read, not two
+
+    async def test_update_status_during_a_failing_read_fails_with_it(self):
+        entered = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def reply(timeout):
+            entered.set()
+            await finish.wait()
+            raise driver.ConnectionError("No status")
+
+        with patch.object(self.device, "_open_connection", AsyncMock()), \
+             patch.object(self.device, "_set_time", AsyncMock()), \
+             patch.object(driver, "SET_TIME_PACING", 0), \
+             patch.object(self.device, "_await_status_reply", reply):
+            poll = asyncio.create_task(self.device.connect())
+            await entered.wait()
+            update = asyncio.create_task(self.device.connect())
+            await asyncio.sleep(0)
+            finish.set()
+            with self.assertRaises(driver.ConnectionError):
+                await poll
+            with self.assertRaises(driver.ConnectionError):
+                await update
+
     async def test_overlapping_polls_are_refused(self):
         entered = asyncio.Event()
         finish = asyncio.Event()

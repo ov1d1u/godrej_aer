@@ -203,8 +203,9 @@ class SmartMatic:
         # Counts commands, so a failed status read can tell whether a press
         # used the link while it waited (see _close_after_failed_read).
         self._commands_sent = 0
-        # A status read may be waiting for its reply without holding the lock.
-        self._reading_status = False
+        # The status read in progress, if any. It may be waiting for its
+        # reply without holding the lock; other callers share its result.
+        self._status_read: asyncio.Future | None = None
         # Loop time of the last failed connect, so queued commands give up
         # at once instead of each waiting out their own attempts.
         self._connect_failed_at: float | None = None
@@ -259,12 +260,26 @@ class SmartMatic:
         instead of queueing behind a status read.
         """
         if self._reading_status:
-            raise ConnectionError(f"A status read from {self.mac} is already in progress")
-        self._reading_status = True
+            # e.g. Update status during a background read: share its result.
+            return await asyncio.shield(self._status_read)
+        read = asyncio.get_running_loop().create_future()
+        # Mark a failure as seen even if nobody else was waiting for it.
+        read.add_done_callback(lambda f: f.cancelled() or f.exception())
+        self._status_read = read
         try:
-            return await self._connect_and_read(status_timeout)
-        finally:
-            self._reading_status = False
+            result = await self._connect_and_read(status_timeout)
+        except asyncio.CancelledError:
+            read.cancel()
+            raise
+        except BaseException as e:
+            read.set_exception(e)
+            raise
+        read.set_result(result)
+        return result
+
+    @property
+    def _reading_status(self) -> bool:
+        return self._status_read is not None and not self._status_read.done()
 
     async def _connect_and_read(self, status_timeout: float) -> bool:
         commands_before = self._commands_sent
