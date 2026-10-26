@@ -21,8 +21,9 @@ DEFAULT_REPLY_CHAR = NOTIFY_CHAR
 # Seconds to stay connected after a successful exchange before dropping the
 # link (keeping it open drains the device battery).
 DISCONNECT_DELAY = 15
-# Seconds to wait for the status notification after asking for it.
-STATUS_TIMEOUT = 30
+# Seconds to wait for the status notification after asking for it. Replies
+# usually take well under a second; the slowest seen took about 3 s.
+STATUS_TIMEOUT = 5
 # Seconds to wait for a reply from each candidate while probing (replies
 # have been seen to take up to ~3 s).
 PROBE_TIMEOUT = 8
