@@ -251,7 +251,9 @@ class SmartMatic:
     def _write_char(self) -> str:
         return self._command_char
 
-    async def connect(self, *, status_timeout: float = STATUS_TIMEOUT) -> bool:
+    async def connect(
+        self, *, status_timeout: float = STATUS_TIMEOUT, purpose: str = "status poll"
+    ) -> bool:
         """Open the BLE link and fetch a fresh device status.
 
         The link lock is held only while the link is opened and messages
@@ -267,7 +269,7 @@ class SmartMatic:
         read.add_done_callback(lambda f: f.cancelled() or f.exception())
         self._status_read = read
         try:
-            result = await self._connect_and_read(status_timeout)
+            result = await self._connect_and_read(status_timeout, purpose)
         except asyncio.CancelledError:
             read.cancel()
             raise
@@ -281,12 +283,12 @@ class SmartMatic:
     def _reading_status(self) -> bool:
         return self._status_read is not None and not self._status_read.done()
 
-    async def _connect_and_read(self, status_timeout: float) -> bool:
+    async def _connect_and_read(self, status_timeout: float, purpose: str) -> bool:
         commands_before = self._commands_sent
         status_before = self.device_status
         async with self._connect_lock:
             self._cancel_delayed_disconnect()
-            await self._open_connection()
+            await self._open_connection(purpose=purpose)
             try:
                 await self._set_time(pace=False)
             except BaseException:

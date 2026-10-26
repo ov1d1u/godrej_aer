@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
@@ -17,6 +18,18 @@ _LOGGER = logging.getLogger(__name__)
 SERVICE_UPDATE_STATUS = "update_status"
 
 
+async def _extract_config_entry_ids(hass: HomeAssistant, call: ServiceCall) -> set[str]:
+    """Call the helper with the signature this Home Assistant expects.
+
+    It took ``(hass, call)`` until HA 2025.x, then ``(call)``; the old form
+    was removed in 2026.10.
+    """
+    params = list(inspect.signature(async_extract_config_entry_ids).parameters)
+    if params and params[0] == "hass":
+        return await async_extract_config_entry_ids(hass, call)
+    return await async_extract_config_entry_ids(call)
+
+
 async def _async_matched_instances(
     hass: HomeAssistant, call: ServiceCall
 ) -> list[SmartMatic]:
@@ -25,7 +38,7 @@ async def _async_matched_instances(
     Resolves the call's area/device/entity target to loaded config entries.
     With no target, every loaded Godrej Aer entry is used.
     """
-    entry_ids = await async_extract_config_entry_ids(hass, call)
+    entry_ids = await _extract_config_entry_ids(hass, call)
 
     instances: list[SmartMatic] = []
     for entry in hass.config_entries.async_entries(DOMAIN):
@@ -55,7 +68,7 @@ def async_setup_services(hass: HomeAssistant) -> None:
             )
 
         results = await asyncio.gather(
-            *(instance.connect() for instance in instances),
+            *(instance.connect(purpose="update status") for instance in instances),
             return_exceptions=True,
         )
 
