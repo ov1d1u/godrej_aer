@@ -283,6 +283,7 @@ class SmartMatic:
 
     async def _connect_and_read(self, status_timeout: float) -> bool:
         commands_before = self._commands_sent
+        status_before = self.device_status
         async with self._connect_lock:
             self._cancel_delayed_disconnect()
             await self._open_connection()
@@ -300,9 +301,19 @@ class SmartMatic:
                 _LOGGER.debug(">> %s: %s (fetch status)", self._write_char, FETCH_STATUS_MSG.hex())
                 await self._write_message(FETCH_STATUS_MSG)
             await self._await_status_reply(status_timeout)
-        except BaseException:
+        except BaseException as error:
             await self._close_after_failed_read(commands_before)
-            raise
+            # Cleanup may have waited for an action's refresh to finish.
+            # Accept its fresh status instead of reporting the older error
+            # and marking the device unreachable after a successful reply.
+            # Cancellation and failures after that reply still propagate.
+            recovered = (
+                isinstance(error, ConnectionError)
+                and self.device_status is not status_before
+                and self._last_exchange_ok is True
+            )
+            if not recovered:
+                raise
 
         # Got a fresh status, clear any retry cooldown from earlier failures.
         self._retry_after = None
