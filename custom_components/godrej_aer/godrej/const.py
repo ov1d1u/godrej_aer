@@ -30,7 +30,9 @@ PROBE_TIMEOUT = 8
 # Total time detection may take (defaults check plus fallback probing).
 DETECT_TIMEOUT = 60
 # Seconds to wait for a command's acknowledgement, counted from its write.
-ACK_TIMEOUT = 3
+# Fresh links answer in ~0.1 s; on a link left open for a few seconds the
+# device has been seen to take just over 3 s.
+ACK_TIMEOUT = 5
 # Every connection (presses, polls, setup) makes one attempt of at most
 # this many seconds; a working device connects in about 1 s. This keeps
 # press feedback quick even when a poll is connecting at the same time.

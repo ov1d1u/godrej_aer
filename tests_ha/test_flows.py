@@ -620,3 +620,18 @@ async def test_failed_poll_retries_when_the_backoff_ends(hass):
             async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=31))
             await hass.async_block_till_done()
             assert connect.await_count == 2  # not a minute later
+
+
+async def test_update_status_works_with_the_current_target_helper(hass, caplog):
+    """HA 2026.10 removed the old (hass, call) form; it used to log a warning."""
+    from homeassistant.helpers import device_registry as dr
+
+    entry = make_entry(hass)
+    await setup_entry(hass, entry)
+    device = dr.async_entries_for_config_entry(dr.async_get(hass), entry.entry_id)[0]
+    with patch.object(entry.runtime_data, "connect", AsyncMock(return_value=True)) as connect:
+        await hass.services.async_call(
+            DOMAIN, "update_status", {"device_id": device.id}, blocking=True
+        )
+    connect.assert_awaited_once_with(purpose="update status")
+    assert "deprecated argument hass" not in caplog.text
