@@ -9,19 +9,20 @@ This integration currently supports the following features:
 - Status sensor: Idle, Auto, Schedule or Disconnected (not heard, or the last exchange failed); the mode is from the last status read (see Updated last)
 - Spray once via a `button` entity
 - Auto-spray mode via a `select` entity: Off, or every 10, 20 or 40 minutes (attribute `started_by`: app, schedule or button)
-- Identify (diagnostic button): lights the device's three interval lights for a few seconds. Works only while auto-spray is off and no schedule is running
+- Identify (diagnostic button): lights the device's three interval lights for 3 seconds. Works only while auto-spray is off and no schedule is running
 - Reset the refill level via a `button` entity (after replacing the cartridge)
 - Battery level as a percentage of what the device can use: the alkaline discharge curve, from 3.1 V (100 %) down to the device's 2.4 V cut-off (0 %); the measured voltage is a diagnostic sensor. Below 2.4 V the device still acknowledges sprays without spraying, so Spray now and Spray: auto show "Batteries are too low to spray"
 - Estimated refill level (%) and lifetime spray count sensors
-- Connection state via a `binary_sensor` entity
+- Connection status (diagnostic): OK, or Unreachable when the device isn't heard or the last exchange failed
+- Updated last (diagnostic): when the last status was read; the Update status button reads it now
 - On-demand status refresh via the `godrej_aer.update_status` service
 
 ## Services
 
 ### `godrej_aer.update_status`
 
-Connects to the device and refreshes its status (battery voltage and
-connection state), bypassing the automatic retry cooldown that applies to
+Connects to the device and refreshes its status (mode, battery, counters),
+bypassing the automatic retry cooldown that applies to
 background polling. Target one or more devices/entities, or call it without
 a target to update every configured device.
 
@@ -105,8 +106,9 @@ link opening and closing is normal. **Connection status** shows whether the devi
 actually working: it reads **OK**, and changes to **Unreachable** only if an
 exchange fails or the device stops advertising. After a failed attempt the
 integration retries after 30 s, then 1, 2 and 5 minutes, and every 5 minutes
-from then on until the device answers. Its `last_update` attribute
-shows when the last status arrived. The raw **Connection link** sensor
+from then on until the device answers. **Updated last** shows when the
+last status arrived, and **Status** shows Disconnected while Connection
+status is Unreachable. The raw **Connection link** sensor
 (Active/Idle) is disabled by default; enable it to debug connections.
 
 ## Troubleshooting
