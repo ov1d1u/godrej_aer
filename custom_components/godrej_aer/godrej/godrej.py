@@ -904,16 +904,34 @@ class SmartMatic:
         """
         queued_at = asyncio.get_running_loop().time()
         async with self._command_lock:
-            self._cancel_refresh()
-            async with self._connect_lock:
-                failed_at = self._connect_failed_at
-                if failed_at is not None and failed_at >= queued_at:
-                    raise ConnectionError(
-                        f"{self.mac} could not be reached for an earlier command"
-                    )
-                return await self._send_command(
-                    payload, reply_mt, char=char, timeout=timeout, refresh=refresh
+            return await self._write_action_locked(
+                payload, reply_mt, char=char, timeout=timeout,
+                refresh=refresh, queued_at=queued_at,
+            )
+
+    async def _write_action_locked(
+        self, payload: bytes, reply_mt: int, *, char: str | None = None,
+        timeout: float = ACK_TIMEOUT, refresh: bool = True,
+        queued_at: float | None = None,
+    ) -> DeviceStatus:
+        """Send one command; the caller must hold ``_command_lock``.
+
+        For sequences such as Identify, which hold the lock across all
+        of their commands so that nothing else can slip in between them.
+        """
+        loop = asyncio.get_running_loop()
+        if queued_at is None:
+            queued_at = loop.time()
+        self._cancel_refresh()
+        async with self._connect_lock:
+            failed_at = self._connect_failed_at
+            if failed_at is not None and failed_at >= queued_at:
+                raise ConnectionError(
+                    f"{self.mac} could not be reached for an earlier command"
                 )
+            return await self._send_command(
+                payload, reply_mt, char=char, timeout=timeout, refresh=refresh
+            )
 
     async def _send_command(
         self, payload: bytes, reply_mt: int, *, char: str | None = None,
@@ -1046,6 +1064,12 @@ class SmartMatic:
         already off (re-sending an interval restarts auto mode with a
         spray; "auto off" would stop auto mode or pause a schedule run).
         Reads a fresh status first to check.
+
+        The whole sequence holds ``_command_lock``: an interval picked
+        during the wait would otherwise be started on the device and then
+        stopped again by the "auto off" that clears the lights. That
+        "auto off" is sent from a ``finally``, so the lights don't stay
+        lit when the test isn't confirmed or the wait is cancelled.
         """
         await self.connect(purpose="identify")
         status = self.device_status
@@ -1054,10 +1078,28 @@ class SmartMatic:
                 f"{self.mac} is not idle",
                 schedule=bool(status and status.spray_source == "schedule"),
             )
-        _LOGGER.debug("Sending LED test to %s", self.mac)
-        await self._write_action(LED_TEST_MSG, 163, refresh=False)
-        await asyncio.sleep(IDENTIFY_SECONDS)
-        await self.stop_spray()
+        async with self._command_lock:
+            try:
+                _LOGGER.debug("Sending LED test to %s", self.mac)
+                await self._write_action_locked(LED_TEST_MSG, 163, refresh=False)
+                await asyncio.sleep(IDENTIFY_SECONDS)
+            finally:
+                await self._clear_identify_lights()
+
+    async def _clear_identify_lights(self):
+        """Send "auto off" to clear the Identify lights, come what may.
+
+        Shielded, so that a cancelled wait (on an HA shutdown, say) still
+        clears them, and its own failures are logged rather than raised,
+        to leave the reason Identify ended intact.
+        """
+        _LOGGER.debug("Sending auto spray off command to %s to clear the lights", self.mac)
+        try:
+            await asyncio.shield(self._write_action_locked(STOP_SPRAY_MSG, 156))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _LOGGER.warning("Could not clear the lights of %s: %s", self.mac, e)
 
     async def reset_refill(self):
         """Tell the device its cartridge has been refilled."""

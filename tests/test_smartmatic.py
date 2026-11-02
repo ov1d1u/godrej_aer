@@ -929,22 +929,102 @@ async def test_normal_connection_does_not_walk_the_characteristics(monkeypatch):
     assert matic.device_status.is_valid
 
 
-async def test_identify_lights_then_clears_while_idle(monkeypatch):
+_GATED = 99.0  # the Identify wait the gated sleep recognises
+
+
+def idle_identify(monkeypatch, device, *, gate_wait=False):
+    """A SmartMatic that reads back idle, ready to be asked to identify.
+
+    ``gate_wait``: Identify's wait blocks until the returned event is set,
+    so a test can act while the lights are on.
+    """
     from unittest.mock import AsyncMock
     from godrej.devicestatus import DeviceStatus
 
-    monkeypatch.setattr(gm, "IDENTIFY_SECONDS", 0)
-    device = FakeDevice(command_char=C4, status_frame=FRAME_308_IN)
     matic = attach(monkeypatch, device, command_char=C4, reply_char=C1)
     idle = DeviceStatus(gm.encode_message(mT=157, mN=157, ack=200, bV=3100, cS=0))
 
     async def fresh_status(**_):
         matic.device_status = idle
     matic.connect = AsyncMock(side_effect=fresh_status)
+
+    if not gate_wait:
+        monkeypatch.setattr(gm, "IDENTIFY_SECONDS", 0)
+        return matic, None, None
+
+    lit = asyncio.Event()
+    release = asyncio.Event()
+    monkeypatch.setattr(gm, "IDENTIFY_SECONDS", _GATED)
+    real_sleep = asyncio.sleep
+
+    async def gated_sleep(delay, *args, **kwargs):
+        if delay is _GATED:
+            lit.set()
+            await release.wait()
+            return
+        await real_sleep(min(delay, 0.01), *args, **kwargs)
+
+    monkeypatch.setattr(gm.asyncio, "sleep", gated_sleep)
+    return matic, lit, release
+
+
+def commands(device):
+    """The message types written, without the status requests."""
+    types = [cbor.loads(payload)["mT"] for _, payload in device.writes]
+    return [mt for mt in types if mt != 107]
+
+
+async def test_identify_lights_then_clears_while_idle(monkeypatch):
+    device = FakeDevice(command_char=C4, status_frame=FRAME_308_IN)
+    matic, _, _ = idle_identify(monkeypatch, device)
+
     await matic.identify()
     await matic._refresh_task
-    sent = [cbor.loads(payload)["mT"] for _, payload in device.writes]
-    assert sent[:2] == [113, 106]  # LED test, then auto off to clear the lights
+    assert commands(device) == [113, 106]  # LED test, then auto off to clear
+
+
+async def test_identify_does_not_stop_an_interval_picked_during_its_wait(monkeypatch):
+    """The auto off that clears the lights must not undo a fresh interval."""
+    device = FakeDevice(command_char=C4, status_frame=FRAME_308_IN)
+    matic, lit, release = idle_identify(monkeypatch, device, gate_wait=True)
+
+    identifying = asyncio.create_task(matic.identify())
+    await asyncio.wait_for(lit.wait(), 1)
+    picking = asyncio.create_task(matic.set_spray_interval(10))
+    for _ in range(20):  # the interval command waits its turn
+        await asyncio.sleep(0)
+    assert commands(device) == [113]  # LED test only
+
+    release.set()
+    await asyncio.wait_for(identifying, 1)
+    await asyncio.wait_for(picking, 1)
+    await matic._refresh_task
+    # LED test, the auto off clearing the lights, then every 10 min
+    assert commands(device) == [113, 106, 104]
+
+
+async def test_identify_clears_the_lights_when_the_test_is_not_confirmed(monkeypatch):
+    """The device may light them anyway, so auto off is sent regardless."""
+    device = FakeDevice(command_char=C4, status_frame=FRAME_308_IN, ack=None)
+    matic, _, _ = idle_identify(monkeypatch, device)
+
+    with pytest.raises(CommandNotConfirmed):
+        await matic.identify()
+    assert commands(device) == [113, 106]
+
+
+async def test_identify_clears_the_lights_when_its_wait_is_cancelled(monkeypatch):
+    """As on an HA shutdown; the lights would stay lit until a mode command."""
+    device = FakeDevice(command_char=C4, status_frame=FRAME_308_IN)
+    matic, lit, _ = idle_identify(monkeypatch, device, gate_wait=True)
+
+    identifying = asyncio.create_task(matic.identify())
+    await asyncio.wait_for(lit.wait(), 1)
+    identifying.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await identifying
+    assert commands(device) == [113, 106]
+    await matic._refresh_task
 
 
 async def test_identify_refuses_unless_idle(monkeypatch):
