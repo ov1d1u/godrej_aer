@@ -755,7 +755,7 @@ class SmartMatic:
             return
 
         char = char or self._write_char
-        _LOGGER.debug("Setting the clock on %s", self.mac)
+        _LOGGER.debug(">> %s: %s (set time)", char, payload.hex())
         try:
             await self._write_message(payload, char=char)
         except Exception as e:
@@ -786,7 +786,7 @@ class SmartMatic:
         """Send fetch-status to ``char``; True if a status reply arrived."""
         self._device_status_event.clear()
 
-        _LOGGER.debug("Asking %s for its status via %s", self.mac, char[:8])
+        _LOGGER.debug(">> %s: %s (fetch status)", char, message.hex())
         try:
             await self._write_message(message, char=char)
         except Exception as e:
@@ -952,7 +952,7 @@ class SmartMatic:
         self._ack_waiters[reply_mt] = future
         try:
             char = char or self._write_char
-            _LOGGER.debug("Sent to %s via %s; waiting for its reply", self.mac, char[:8])
+            _LOGGER.debug(">> %s: %s", char, payload.hex())
             await self._write_message(payload, char=char)
             sent_at = loop.time()
             reply = await asyncio.wait_for(future, timeout)
@@ -1126,11 +1126,12 @@ class SmartMatic:
 
     def _on_notification(self, uuid: str, data: bytes):
         """Buffer fragments per characteristic until a CBOR item is complete."""
+        _LOGGER.debug("<< %s (%d): %s", uuid, len(data), bytes(data).hex())
 
         now = time.monotonic()
         buf, last = self._rx_buffers.get(uuid, (bytearray(), now))
         if buf and now - last > _FRAGMENT_TIMEOUT:
-            _LOGGER.debug("Dropping a stale partial reply on %s (%d bytes)", uuid[:8], len(buf))
+            _LOGGER.debug("Dropping stale partial frame on %s: %s", uuid, buf.hex())
             buf = bytearray()
         buf.extend(data)
 
