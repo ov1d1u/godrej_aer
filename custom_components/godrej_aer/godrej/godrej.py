@@ -30,6 +30,12 @@ from .const import (
     SPRAY_INTERVALS,
     DEFAULT_SPRAY_INTERVAL,
     ACTION_SETTLE,
+    SCHEDULE_CHAR,
+    SCHEDULE_REPLY_TIMEOUT,
+    SCHEDULE_PAUSE,
+)
+from .schedule import (
+    Schedule, ScheduleError, normalise_schedule_dict, validate as validate_schedules,
 )
 from .eventbus import EventBus
 from .devicestatus import ACK_OK, DeviceStatus
@@ -39,11 +45,14 @@ from .exception import (
     InvalidDeviceError,
     ConnectionError,
     NotIdle,
+    SchedulesChanged,
+    SchedulesNotStored,
 )
 from .events import (
     DEVICE_CONNECT,
     DEVICE_DISCONNECT,
     DEVICE_REACHABILITY,
+    DEVICE_SCHEDULES_UPDATE,
     DEVICE_STATUS_UPDATE
 )
 
@@ -62,6 +71,9 @@ _ACK_LABELS = {
     154: "Spray command",
     155: "Refill reset",
     156: "Auto-spray stop",
+    153: "Schedule upload",
+    158: "Schedule removal",
+    159: "Schedule read",
     163: "LED test",
 }
 # Detection tags each probe with its own message number (mN), so a late
@@ -136,6 +148,28 @@ LED_TEST_MSG = encode_message(mT=113, mN=163)
 # Seconds the lights stay on for Identify.
 IDENTIFY_SECONDS = 3
 
+REMOVE_SCHEDULES_MSG = encode_message(mT=108, mN=158)
+RETRIEVE_SCHEDULES_MSG = encode_message(mT=109, mN=159)
+
+
+def encode_schedules(schedules: list[Schedule]) -> bytes:
+    """Build the ``mT=103`` set-schedules message.
+
+    ``{mT, mN, S: [{s: <5 bytes>}, ...]}``, with Jackson's indefinite-length
+    map and array markers.
+    """
+    out = bytearray([0xBF])
+    out += _cbor_key("mT") + _cbor_uint(103)
+    out += _cbor_key("mN") + _cbor_uint(153)
+    out += _cbor_key("S") + bytes([0x9F])  # indefinite-length array
+    for schedule in schedules:
+        entry = schedule.to_bytes()
+        out += bytes([0xBF]) + _cbor_key("s") + bytes([0x40 | len(entry)]) + entry
+        out += bytes([0xFF])
+    out += bytes([0xFF, 0xFF])  # end of array, end of map
+    return bytes(out)
+
+
 def encode_set_time(now: datetime | None = None) -> bytes:
     """Build the ``mT=102`` set-time message the way the official app does.
 
@@ -186,6 +220,9 @@ class SmartMatic:
         self.mac = mac
         self.client: BleakClient | None = None
         self.device_status: DeviceStatus | None = None
+        # The device's own schedules as last read back; None until read.
+        self.schedules: list[Schedule] | None = None
+        self.schedules_read_at: datetime | None = None
         self.eventbus = EventBus()
 
         self._connect_lock = asyncio.Lock()
@@ -329,6 +366,126 @@ class SmartMatic:
         self._poll_failures = 0
         await self.delayed_disconnect()
         return True
+
+    async def read_schedules(self) -> list[Schedule]:
+        """Read the schedules stored on the device."""
+        _LOGGER.debug("Asking %s for its schedules", self.mac)
+        reply = await self._write_action(
+            RETRIEVE_SCHEDULES_MSG, 159, timeout=SCHEDULE_REPLY_TIMEOUT, refresh=False
+        )
+        entries = []
+        try:
+            message = cbor.loads(reply.raw)
+            for item in message.get("S") or []:
+                entries.append(Schedule.from_bytes(bytes(item["s"])))
+        except (cbor.CBORError, KeyError, TypeError, ScheduleError) as e:
+            raise ConnectionError(f"Unreadable schedule list from {self.mac}: {e}") from e
+        _LOGGER.debug(
+            "Schedules on %s: %s", self.mac, "; ".join(map(str, entries)) or "none"
+        )
+        self.schedules = entries
+        self.schedules_read_at = dt_util.utcnow()
+        self.eventbus.send(DEVICE_SCHEDULES_UPDATE, self)
+        return entries
+
+    async def set_schedules(
+        self, schedules: list[Schedule], expected: list[dict] | None = None
+    ) -> list[Schedule]:
+        """Replace the device's schedules.
+
+        "Remove all", a 3 s pause, then one upload with every schedule
+        (skipped for an empty list), then a read-back so ``schedules``
+        shows what the device actually holds.
+
+        ``expected``: the list an edit started from, as the Schedules sensor
+        shows it. If given, the device is read first and nothing is
+        written when its list differs (changed elsewhere meanwhile).
+        """
+        validate_schedules(schedules)
+        if expected is not None:
+            current = [normalise_schedule_dict(s.as_dict()) for s in await self.read_schedules()]
+            if current != [normalise_schedule_dict(e) for e in expected]:
+                raise SchedulesChanged(f"The schedules on {self.mac} changed")
+        _LOGGER.debug(
+            "Replacing the schedules on %s with: %s",
+            self.mac, "; ".join(map(str, schedules)) or "none",
+        )
+        loop = asyncio.get_running_loop()
+        removed_at = loop.time()
+        await self._write_action(
+            REMOVE_SCHEDULES_MSG, 158, timeout=SCHEDULE_REPLY_TIMEOUT, refresh=False
+        )
+        if schedules:
+            await asyncio.sleep(max(0.0, SCHEDULE_PAUSE - (loop.time() - removed_at)))
+            await self._write_action(
+                encode_schedules(schedules), 153, char=SCHEDULE_CHAR,
+                timeout=SCHEDULE_REPLY_TIMEOUT, refresh=False,
+            )
+        stored = await self.read_schedules()
+        # Above 144 sprays the device acknowledges the upload but drops the
+        # schedule, so check what it actually holds.
+        if [s.to_bytes() for s in stored] != [s.to_bytes() for s in schedules]:
+            raise SchedulesNotStored(
+                f"{self.mac} holds {len(stored)} of the {len(schedules)} schedules sent"
+            )
+        return stored
+
+    @staticmethod
+    def _schedule_target(target) -> int:
+        """Schedule number 1-10, "current" or "all" -> the device's code."""
+        if target == "current":
+            return 128
+        if target == "all":
+            return 255
+        number = int(target)
+        if not 1 <= number <= 10:
+            raise ScheduleError("Pick a schedule number from 1 to 10, current or all")
+        return number - 1
+
+    async def stop_schedule(self, target) -> None:
+        """Skip the rest of a schedule's run today (106 with its number).
+
+        Tested on fw 3.0.8-IN: the run stops and manual control works
+        again. The schedule runs as usual in its next window: the device
+        clears the stop once its clock has been past the window's end for
+        about 50 s (it checks its schedules every ~45-50 s).
+        """
+        code = self._schedule_target(target)
+        _LOGGER.debug("Sending stop schedule (%s, code %s) to %s", target, code, self.mac)
+        await self._write_action(encode_message(mT=106, mN=156, sS=code), 156)
+
+    def running_schedule(self, now: datetime | None = None) -> int | None:
+        """The number (1-based) of the schedule running now, if any.
+
+        From the status (a schedule run, with its interval) and the last
+        read list: the schedule with a window holding ``now``, including one
+        that started yesterday and runs past midnight, allowing a minute past
+        the end (the device checks its schedules about every 45-50 s).
+        """
+        status = self.device_status
+        if not self.schedules or status is None or status.spray_source != "schedule":
+            return None
+        now = now or dt_util.now()
+        minute = now.weekday() * 24 * 60 + now.hour * 60 + now.minute
+        for number, schedule in enumerate(self.schedules, start=1):
+            if schedule.interval == status.spray_interval and any(
+                start <= minute <= end + 1 for start, end in schedule.windows()
+            ):
+                return number
+        return None
+
+    async def add_schedule(self, schedule: Schedule) -> list[Schedule]:
+        current = await self.read_schedules()
+        return await self.set_schedules([*current, schedule])
+
+    async def remove_schedule(self, number: int) -> list[Schedule]:
+        """Remove schedule ``number`` (1-based, as listed by ``schedules``)."""
+        current = await self.read_schedules()
+        if not 1 <= number <= len(current):
+            raise ScheduleError(
+                f"There is no schedule {number}; the device has {len(current)}"
+            )
+        return await self.set_schedules(current[:number - 1] + current[number:])
 
     async def _await_status_reply(self, timeout: float) -> None:
         """Wait for the status reply, without holding the link lock."""

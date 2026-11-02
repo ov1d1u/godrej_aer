@@ -21,6 +21,12 @@ class NotIdle(HomeAssistantError):
         super().__init__(message)
         self.schedule = schedule
 
+class SchedulesChanged(HomeAssistantError):
+    """The device's schedules differ from the list an edit started from."""
+
+class SchedulesNotStored(HomeAssistantError):
+    """The device acknowledged a schedule upload but doesn't hold the list."""
+
 class BatteryTooLow(HomeAssistantError):
     """A spray command was acknowledged, but the batteries are below the
     device's cut-off, so the motor won't run."""

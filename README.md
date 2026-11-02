@@ -21,8 +21,8 @@ This integration currently supports the following features:
 
 ### `godrej_aer.update_status`
 
-Connects to the device and refreshes its status (mode, battery, counters),
-bypassing the automatic retry cooldown that applies to
+Connects to the device, refreshes its status (mode, battery, counters) and
+reads its schedules, bypassing the automatic retry cooldown that applies to
 background polling. Target one or more devices/entities, or call it without
 a target to update every configured device.
 
@@ -80,6 +80,21 @@ answers. If nothing answers, nothing is stored and you can try again.
 To check again, for example after a firmware update, use **Reconfigure** on
 the integration entry. Setup and Reconfigure show each step as it runs.
 Devices added with an older version use the defaults until reconfigured.
+
+## Schedules
+
+The device runs up to 10 schedules on its own: days, a start and end time,
+and an interval of 10, 20 or 40 minutes. An end at or before the start means
+the next day, so a window can run past midnight, up to 24 hours. The end is
+rounded down to a whole interval.
+
+- **Schedules** sensor: the device's list, as attributes.
+- Actions: **Add schedule**, **Remove schedule** (by its number in that
+  list), **Set schedules**, **Clear schedules**, and **Skip schedule run**
+  (stops today's run; it runs again in its next window).
+- Other tools that write the device's schedules may not read them back
+  first, so a change made there can replace the ones set here. Manage them
+  from one place.
 
 ## Command confirmation
 
