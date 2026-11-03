@@ -83,13 +83,19 @@ class FakeDevice:
     (6e400001), as bleak-esphome does on v3 proxy connections.
     ``chunk``: notification payload size (ATT MTU - 3).
     ``needs_time``: stays silent until it has received a set-time message.
+    ``lists_schedules``: answers the retrieve-schedules message (109), as
+    fw 3.0.8-IN does; other firmwares stay silent. ``stores_schedules``:
+    acknowledges the upload (103) as well.
     """
 
     def __init__(
         self, *, command_char, status_frame, reply_char=C1,
         via_proxy=True, chunk=182, needs_time=False, extra_chars=(),
         ack=200, echo_mn=False, reply_delay=0.0,
+        lists_schedules=True, stores_schedules=True,
     ):
+        self.lists_schedules = lists_schedules
+        self.stores_schedules = stores_schedules
         self.command_char = command_char
         self.ack = ack
         self.echo_mn = echo_mn
@@ -152,7 +158,10 @@ class FakeDevice:
                     )
                 self._notify(self.reply_char, frame, self.reply_delay)
         elif mt == 109 and self.ack is not None:
-            self._notify(self.reply_char, schedule_reply(self.stored_schedules))
+            if self.lists_schedules:
+                self._notify(self.reply_char, schedule_reply(self.stored_schedules))
+        elif mt == 103 and not self.stores_schedules:
+            pass  # takes the upload, never answers
         elif self.ack is not None:
             if mt == 108:
                 self.stored_schedules = []
@@ -1164,6 +1173,48 @@ async def test_add_and_remove_work_on_what_the_device_holds(monkeypatch):
     assert await matic.remove_schedule(1) == [second]
     with pytest.raises(ScheduleError, match="no schedule 5"):
         await matic.remove_schedule(5)
+
+
+async def test_edits_do_not_overwrite_each_other(monkeypatch):
+    """Two edits at once: the second works on what the first left."""
+    monkeypatch.setattr(gm, "SCHEDULE_PAUSE", 0)
+    device = FakeDevice(command_char=ALL, status_frame=FRAME_308_IN)
+    matic = attach(monkeypatch, device)
+
+    monday = sched("mon", "08:00", "10:00", 20)
+    tuesday = sched("tue", "08:00", "10:00", 20)
+    await asyncio.gather(matic.add_schedule(monday), matic.add_schedule(tuesday))
+    assert sorted(device.stored_schedules) == sorted([monday.to_bytes(), tuesday.to_bytes()])
+
+
+async def test_a_failed_upload_leaves_the_emptied_list_showing(monkeypatch):
+    """The remove went through, so the stale entries must not linger."""
+    monkeypatch.setattr(gm, "SCHEDULE_PAUSE", 0)
+    monkeypatch.setattr(gm, "SCHEDULE_REPLY_TIMEOUT", 0.05)
+    device = FakeDevice(
+        command_char=ALL, status_frame=FRAME_308_IN, stores_schedules=False
+    )
+    device.stored_schedules = [sched().to_bytes()]
+    matic = attach(monkeypatch, device)
+    await matic.read_schedules()
+
+    with pytest.raises(CommandNotConfirmed):
+        await matic.set_schedules([sched("mon", "08:00", "10:00", 20)])
+    assert matic.schedules == []  # read back after the failure
+
+
+async def test_a_firmware_that_never_lists_schedules_can_still_be_set(monkeypatch, caplog):
+    monkeypatch.setattr(gm, "SCHEDULE_PAUSE", 0)
+    monkeypatch.setattr(gm, "SCHEDULE_REPLY_TIMEOUT", 0.05)
+    device = FakeDevice(
+        command_char=ALL, status_frame=FRAME_308_IN, lists_schedules=False
+    )
+    matic = attach(monkeypatch, device)
+
+    wanted = [sched("mon", "08:00", "10:00", 20)]
+    assert await matic.set_schedules(wanted) == wanted
+    assert device.stored_schedules == [s.to_bytes() for s in wanted]
+    assert "Could not read the schedules" in caplog.text
 
 
 async def test_rejected_upload_raises(monkeypatch):

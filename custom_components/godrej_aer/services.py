@@ -124,7 +124,9 @@ def async_setup_services(hass: HomeAssistant) -> None:
 
         async def _update(instance: SmartMatic) -> None:
             await instance.connect(purpose="update status")
-            await instance.read_schedules()
+            # Only the status read decides whether this failed; a firmware
+            # that does not answer the schedule request is fine.
+            await instance.read_schedules_quietly()
 
         results = await asyncio.gather(
             *(_update(instance) for instance in instances),

@@ -85,7 +85,9 @@ class SmartMaticUpdateStatusButton(SmartMaticButton):
 
     async def _update(self) -> None:
         await self._instance.connect(purpose="update status")
-        await self._instance.read_schedules()
+        # A firmware that never answers the schedule request still gets
+        # its status updated.
+        await self._instance.read_schedules_quietly()
 
 
 class SmartMaticIdentifyButton(SmartMaticButton):

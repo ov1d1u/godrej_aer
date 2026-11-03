@@ -226,6 +226,9 @@ class SmartMatic:
         self.eventbus = EventBus()
 
         self._connect_lock = asyncio.Lock()
+        # Held for a whole schedule read-modify-write, so two edits cannot
+        # read the same list and then overwrite each other.
+        self._schedules_lock = asyncio.Lock()
         self._device_status_event = asyncio.Event()
         self._disconnect_task: asyncio.Task | None = None
         self._retry_after: datetime | None = None
@@ -388,6 +391,19 @@ class SmartMatic:
         self.eventbus.send(DEVICE_SCHEDULES_UPDATE, self)
         return entries
 
+    async def read_schedules_quietly(self) -> list[Schedule] | None:
+        """read_schedules(), but log a failure instead of raising it.
+
+        Reading the list is a courtesy: firmwares that never answer the
+        retrieve message (109) must not fail the exchange it came with.
+        """
+        try:
+            return await self.read_schedules()
+        except Exception as e:
+            _LOGGER.warning("Could not read the schedules of %s: %s", self.mac, e)
+            _LOGGER.debug("Schedule read for %s failed", self.mac, exc_info=True)
+            return None
+
     async def set_schedules(
         self, schedules: list[Schedule], expected: list[dict] | None = None
     ) -> list[Schedule]:
@@ -402,6 +418,13 @@ class SmartMatic:
         written when its list differs (changed elsewhere meanwhile).
         """
         validate_schedules(schedules)
+        async with self._schedules_lock:
+            return await self._set_schedules(schedules, expected)
+
+    async def _set_schedules(
+        self, schedules: list[Schedule], expected: list[dict] | None
+    ) -> list[Schedule]:
+        """set_schedules() with ``_schedules_lock`` already held."""
         if expected is not None:
             current = [normalise_schedule_dict(s.as_dict()) for s in await self.read_schedules()]
             if current != [normalise_schedule_dict(e) for e in expected]:
@@ -415,13 +438,24 @@ class SmartMatic:
         await self._write_action(
             REMOVE_SCHEDULES_MSG, 158, timeout=SCHEDULE_REPLY_TIMEOUT, refresh=False
         )
-        if schedules:
-            await asyncio.sleep(max(0.0, SCHEDULE_PAUSE - (loop.time() - removed_at)))
-            await self._write_action(
-                encode_schedules(schedules), 153, char=SCHEDULE_CHAR,
-                timeout=SCHEDULE_REPLY_TIMEOUT, refresh=False,
-            )
-        stored = await self.read_schedules()
+        # From here the device is empty: whatever goes wrong, read the list
+        # back so ``schedules`` does not keep showing the removed entries.
+        done = False
+        try:
+            if schedules:
+                await asyncio.sleep(max(0.0, SCHEDULE_PAUSE - (loop.time() - removed_at)))
+                await self._write_action(
+                    encode_schedules(schedules), 153, char=SCHEDULE_CHAR,
+                    timeout=SCHEDULE_REPLY_TIMEOUT, refresh=False,
+                )
+            stored = await self.read_schedules_quietly()
+            done = True
+        finally:
+            if not done:
+                await self.read_schedules_quietly()
+        if stored is None:
+            # The device took the upload but will not list it back.
+            return schedules
         # Above 144 sprays the device acknowledges the upload but drops the
         # schedule, so check what it actually holds.
         if [s.to_bytes() for s in stored] != [s.to_bytes() for s in schedules]:
@@ -475,17 +509,24 @@ class SmartMatic:
         return None
 
     async def add_schedule(self, schedule: Schedule) -> list[Schedule]:
-        current = await self.read_schedules()
-        return await self.set_schedules([*current, schedule])
+        # The read and the write it is based on belong together.
+        async with self._schedules_lock:
+            current = await self.read_schedules()
+            wanted = [*current, schedule]
+            validate_schedules(wanted)
+            return await self._set_schedules(wanted, None)
 
     async def remove_schedule(self, number: int) -> list[Schedule]:
         """Remove schedule ``number`` (1-based, as listed by ``schedules``)."""
-        current = await self.read_schedules()
-        if not 1 <= number <= len(current):
-            raise ScheduleError(
-                f"There is no schedule {number}; the device has {len(current)}"
-            )
-        return await self.set_schedules(current[:number - 1] + current[number:])
+        async with self._schedules_lock:
+            current = await self.read_schedules()
+            if not 1 <= number <= len(current):
+                raise ScheduleError(
+                    f"There is no schedule {number}; the device has {len(current)}"
+                )
+            wanted = current[:number - 1] + current[number:]
+            validate_schedules(wanted)
+            return await self._set_schedules(wanted, None)
 
     async def _await_status_reply(self, timeout: float) -> None:
         """Wait for the status reply, without holding the link lock."""
