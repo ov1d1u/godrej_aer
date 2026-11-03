@@ -5,10 +5,12 @@ import logging
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .const import DOMAIN
 from .entity import AcceptedButFlat, async_device_device_info_fn, async_send_command
 from .godrej import SmartMatic, DeviceStatus
 from .godrej.const import SPRAY_INTERVALS
@@ -80,6 +82,13 @@ class SmartMaticAutoSpraySelect(SelectEntity):
     async def async_select_option(self, option: str) -> None:
         _LOGGER.debug("%s: Spray: auto set to %s", self._config_entry.data[CONF_NAME], option)
         status = self._instance.device_status
+        if status is not None and status.spray_source == "schedule":
+            # The device ignores other intervals during a run, and Off only
+            # pauses it: Skip schedule run is the way to stop one.
+            self.async_write_ha_state()
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="auto_during_schedule"
+            )
         if (
             option != OFF
             and status is not None

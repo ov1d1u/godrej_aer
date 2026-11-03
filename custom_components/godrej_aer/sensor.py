@@ -20,10 +20,11 @@ from homeassistant.const import (
 )
 from homeassistant.core import callback
 from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .entity import async_device_device_info_fn
 from .godrej import SmartMatic, DeviceStatus
-from .godrej.events import DEVICE_REACHABILITY, DEVICE_STATUS_UPDATE
+from .godrej.events import DEVICE_REACHABILITY, DEVICE_SCHEDULES_UPDATE, DEVICE_STATUS_UPDATE
 
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
@@ -43,6 +44,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
             "Channel: reply", instance.reply_char,
         ),
         SmartMaticSignalStrengthSensor(instance, config_entry),
+        SmartMaticSchedulesSensor(instance, config_entry),
         SmartMaticUpdatedLastSensor(instance, config_entry),
     ])
 
@@ -272,6 +274,75 @@ class SmartMaticSignalStrengthSensor(SensorEntity):
         }
         self._last_write = time.monotonic()
 
+
+
+class SmartMaticSchedulesSensor(SensorEntity, RestoreEntity):
+    """How many schedules the device holds, with the list as attributes.
+
+    Read back from the device: once after startup, and after every change.
+    Attributes: ``schedules`` (the list), ``running`` (the number of the
+    schedule running now, or None) and ``last_read``. After a restart the
+    last list is restored until the device is read again.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Schedules"
+    _attr_icon = "mdi:calendar-clock"
+    _attr_should_poll = False
+
+    def __init__(self, instance: SmartMatic, config_entry: ConfigEntry):
+        self._instance = instance
+        self._config_entry = config_entry
+        self._attr_unique_id = f"{config_entry.entry_id}_schedules"
+        self._update_from(instance.schedules)
+
+    def _update_from(self, schedules) -> None:
+        if schedules is None:
+            self._attr_native_value = None
+            self._attr_extra_state_attributes = {}
+            return
+        read_at = self._instance.schedules_read_at
+        self._attr_native_value = len(schedules)
+        self._attr_extra_state_attributes = {
+            "schedules": [
+                {"number": i, **schedule.as_dict()}
+                for i, schedule in enumerate(schedules, start=1)
+            ],
+            "running": self._instance.running_schedule(),
+            "last_read": read_at.isoformat() if read_at else None,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        if self._instance.schedules is None and (last := await self.async_get_last_state()):
+            # Until the device is read: the list as last read, not running.
+            try:
+                self._attr_native_value = int(last.state)
+            except (TypeError, ValueError):
+                self._attr_native_value = None
+            if self._attr_native_value is not None:
+                self._attr_extra_state_attributes = {
+                    "schedules": last.attributes.get("schedules", []),
+                    "running": None,
+                    "last_read": last.attributes.get("last_read"),
+                }
+        for event in (DEVICE_SCHEDULES_UPDATE, DEVICE_STATUS_UPDATE):
+            self._instance.eventbus.add_listener(event, self._on_update)
+
+    async def async_will_remove_from_hass(self) -> None:
+        for event in (DEVICE_SCHEDULES_UPDATE, DEVICE_STATUS_UPDATE):
+            self._instance.eventbus.remove_listener(event, self._on_update)
+
+    async def _on_update(self, _data) -> None:
+        if self._instance.schedules is None:
+            return  # keep the restored list until the device is read
+        self._update_from(self._instance.schedules)
+        self.async_write_ha_state()
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return async_device_device_info_fn(
+            self._instance, self._config_entry.data[CONF_NAME]
+        )
 
 
 class SmartMaticUpdatedLastSensor(SensorEntity):
