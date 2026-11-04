@@ -391,6 +391,11 @@ class SmartMatic:
         self.eventbus.send(DEVICE_SCHEDULES_UPDATE, self)
         return entries
 
+    def _set_acknowledged(self, schedules: list[Schedule]) -> None:
+        """The device acknowledged this list: show it until it is read."""
+        self.schedules = list(schedules)
+        self.eventbus.send(DEVICE_SCHEDULES_UPDATE, self)
+
     async def read_schedules_quietly(self) -> list[Schedule] | None:
         """read_schedules(), but log a failure instead of raising it.
 
@@ -438,8 +443,10 @@ class SmartMatic:
         await self._write_action(
             REMOVE_SCHEDULES_MSG, 158, timeout=SCHEDULE_REPLY_TIMEOUT, refresh=False
         )
-        # From here the device is empty: whatever goes wrong, read the list
-        # back so ``schedules`` does not keep showing the removed entries.
+        # Acknowledged: the device is empty now. ``schedules`` follows each
+        # acknowledgement, so it is right even if the read-back below fails.
+        self._set_acknowledged([])
+        # Whatever goes wrong from here, also try to read the list back.
         done = False
         try:
             if schedules:
@@ -448,13 +455,17 @@ class SmartMatic:
                     encode_schedules(schedules), 153, char=SCHEDULE_CHAR,
                     timeout=SCHEDULE_REPLY_TIMEOUT, refresh=False,
                 )
+                self._set_acknowledged(schedules)
+            # Still read back: an acknowledgement doesn't prove the device
+            # kept the list (it drops schedules over 144 sprays).
             stored = await self.read_schedules_quietly()
             done = True
         finally:
             if not done:
                 await self.read_schedules_quietly()
         if stored is None:
-            # The device took the upload but will not list it back.
+            # The device took the upload but will not list it back:
+            # ``schedules`` keeps the acknowledged list.
             return schedules
         # Above 144 sprays the device acknowledges the upload but drops the
         # schedule, so check what it actually holds.
