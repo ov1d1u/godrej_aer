@@ -1150,6 +1150,33 @@ async def test_set_schedules_replaces_the_list_like_the_app(monkeypatch):
     assert events
 
 
+async def test_schedules_follow_the_acknowledgements_when_not_read_back(monkeypatch):
+    """A device that doesn't list its schedules still shows the list it
+    acknowledged, not the old one."""
+    monkeypatch.setattr(gm, "SCHEDULE_PAUSE", 0)
+    device = FakeDevice(command_char=ALL, status_frame=FRAME_308_IN, lists_schedules=False)
+    matic = attach(monkeypatch, device)
+    matic.schedules = [sched("daily", "06:00", "07:00", 20)]
+    wanted = [sched(["mon"], "07:00", "10:00", 20)]
+    assert await matic.set_schedules(wanted) == wanted
+    assert matic.schedules == wanted
+
+
+async def test_schedules_are_empty_once_remove_all_is_acknowledged(monkeypatch):
+    """The upload then goes unanswered and the list can't be read: the
+    device is known to be empty, so that is what is shown."""
+    monkeypatch.setattr(gm, "SCHEDULE_PAUSE", 0)
+    device = FakeDevice(
+        command_char=ALL, status_frame=FRAME_308_IN,
+        lists_schedules=False, stores_schedules=False,
+    )
+    matic = attach(monkeypatch, device)
+    matic.schedules = [sched("daily", "06:00", "07:00", 20)]
+    with pytest.raises(Exception):
+        await matic.set_schedules([sched(["mon"], "07:00", "10:00", 20)])
+    assert matic.schedules == []
+
+
 async def test_clearing_schedules_skips_the_upload(monkeypatch):
     monkeypatch.setattr(gm, "SCHEDULE_PAUSE", 0)
     device = FakeDevice(command_char=ALL, status_frame=FRAME_308_IN)
