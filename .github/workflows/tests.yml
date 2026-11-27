@@ -1,0 +1,44 @@
+name: Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  device:
+    name: Device library
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install pytest pytest-asyncio -r requirements.txt
+      - run: pytest
+
+  home-assistant:
+    name: Home Assistant
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install Home Assistant test harness
+        run: pip install pytest-homeassistant-custom-component
+      - name: Install requirements of the HA components we depend on
+        run: |
+          ha=$(python -c "import homeassistant, os; print(os.path.dirname(homeassistant.__file__))")
+          for c in bluetooth bluetooth_adapters usb; do
+            jq -r '.requirements[]?' "$ha/components/$c/manifest.json"
+          done | sort -u > ha-requirements.txt
+          cat ha-requirements.txt
+          pip install -r ha-requirements.txt
+      - run: pytest tests_ha
