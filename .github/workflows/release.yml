@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Check version and attach zip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match manifest version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(jq -r .version custom_components/godrej_aer/manifest.json)
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "::error::Release tag $TAG does not match manifest version $version"
+            exit 1
+          fi
+
+      - name: Build zip
+        working-directory: custom_components/godrej_aer
+        run: zip -r "$GITHUB_WORKSPACE/godrej_aer.zip" . -x '__pycache__/*' '*/__pycache__/*' '*.pyc'
+
+      - name: Upload zip to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" godrej_aer.zip --clobber
