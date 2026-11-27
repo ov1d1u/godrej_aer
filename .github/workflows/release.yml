@@ -12,7 +12,7 @@ jobs:
     name: Check version and attach zip
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Tag must match manifest version
         env:
