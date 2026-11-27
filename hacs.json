@@ -1,4 +1,5 @@
 {
   "render_readme": true,
-  "name": "Godrej Aer Smart Matic"
+  "name": "Godrej Aer Smart Matic",
+  "homeassistant": "2024.4.0"
 }
